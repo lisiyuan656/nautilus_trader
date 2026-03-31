@@ -87,6 +87,7 @@ visualization = [
   "kaleido>=1.2.0,<2.0.0",
   "simplejson==3.20.2", # Pinned to 3.20.2 because 4.0.0 has no cp313 wheels
 ]
+schwab = ["schwab-py==1.5.0"]
 
 [dependency-groups]
 dev = [
