@@ -17,9 +17,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import datetime as dt
+from collections.abc import Awaitable
+from collections.abc import Callable
 from typing import Any
-from typing import Awaitable
-from typing import Callable
 
 from msgspec import json as msgspec_json
 from schwab.client import Client
@@ -85,6 +85,7 @@ class SchwabDataClient(LiveMarketDataClient):
         instrument_provider: SchwabInstrumentProvider,
         config: SchwabDataClientConfig,
         name: str | None = None,
+        ws_client: SchwabWebSocketClient | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -100,13 +101,17 @@ class SchwabDataClient(LiveMarketDataClient):
         self._http_client = http_client
         self._bars_timestamp_on_close = config.bars_timestamp_on_close
         # WebSocket API
-        self._ws_client = SchwabWebSocketClient(
-            clock=clock,
-            http_client=self._http_client,
-            handler=self._handle_ws_message,
-            handler_reconnect=None,
-            loop=self._loop,
-        )
+        if ws_client:
+            self._ws_client = ws_client
+            self._ws_client.register_handler(self._handle_ws_message)
+        else:
+            self._ws_client = SchwabWebSocketClient(
+                clock=clock,
+                http_client=self._http_client,
+                handler=self._handle_ws_message,
+                handler_reconnect=None,
+                loop=self._loop,
+            )
         self._ws_connected_event = asyncio.Event()
         self._ws_handlers_map = {
             "CHART_EQUITY": self._handle_chart_equity_message,
@@ -450,12 +455,12 @@ class SchwabDataClient(LiveMarketDataClient):
 
         # Convert timestamps to datetime
         if isinstance(request.start, int):
-            start_dt = dt.datetime.fromtimestamp(request.start / 1e9, tz=dt.timezone.utc)
+            start_dt = dt.datetime.fromtimestamp(request.start / 1e9, tz=dt.UTC)
         else:
             start_dt = request.start.floor("us").to_pydatetime()
 
         if isinstance(request.end, int):
-            end_dt = dt.datetime.fromtimestamp(request.end / 1e9, tz=dt.timezone.utc)
+            end_dt = dt.datetime.fromtimestamp(request.end / 1e9, tz=dt.UTC)
         else:
             end_dt = request.end.floor("us").to_pydatetime()
 

@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from collections.abc import Awaitable
 from collections.abc import Callable
 from typing import Any
@@ -38,7 +39,7 @@ class SchwabWebSocketClient:
         self,
         clock: LiveClock,
         http_client: SchwabHttpClient,
-        handler: Callable[[bytes], None],
+        handler: Callable[[bytes], None] | None,
         handler_reconnect: Callable[..., Awaitable[None]] | None,
         loop: asyncio.AbstractEventLoop,
     ) -> None:
@@ -67,6 +68,14 @@ class SchwabWebSocketClient:
         }
         self._ws_auth_timeout_secs = 5.0
         self._account_activity_service = "ACCT_ACTIVITY"
+
+    def register_handler(self, handler: Callable[[bytes], None]) -> None:
+        if handler not in self._handlers:
+            self._handlers.append(handler)
+
+    def register_reconnect_handler(self, handler: Callable[..., Awaitable[None]]) -> None:
+        if handler not in self._reconnect_handlers:
+            self._reconnect_handlers.append(handler)
 
     # @property
     # def subscriptions(self) -> list[str]:
@@ -116,26 +125,35 @@ class SchwabWebSocketClient:
         """
         await self.connect()
         await self._subscribe_all()
-
-        if self._handler_reconnect:
-            await self._handler_reconnect()
+        for handler in self._reconnect_handlers:
+            await handler()
 
     async def _subscribe_all(self) -> None:
-        if "CHART_EQUITY" in self._subscriptions:
-            for symbol in self._subscriptions["CHART_EQUITY"]:
-                await self.subscribe_klines(symbol, "1-MINUTE-LAST")
-        if "LEVELONE_EQUITIES" in self._subscriptions:
-            for symbol in self._subscriptions["LEVELONE_EQUITIES"]:
-                await self.subscribe_quote_ticks(symbol)
-        if "NASDAQ_BOOK" in self._subscriptions:
-            for symbol in self._subscriptions["NASDAQ_BOOK"]:
-                await self.subscribe_order_book_deltas(symbol, "XNAS")
-        if "NYSE_BOOK" in self._subscriptions:
-            for symbol in self._subscriptions["NYSE_BOOK"]:
-                await self.subscribe_order_book_deltas(symbol, "XNYS")
-        if "OPTIONS_BOOK" in self._subscriptions:
-            for symbol in self._subscriptions["OPTIONS_BOOK"]:
-                await self.subscribe_order_book_deltas(symbol, "SMART")
+        self._log.info("Re-subscribing to all previously subscribed services...")
+
+        subscriptions_to_restore = copy.deepcopy(self._subscriptions)
+
+        for service, symbols in subscriptions_to_restore.items():
+            if service == self._account_activity_service:
+                continue
+            if not symbols:
+                continue
+
+            self._log.debug(f"Re-subscribing to {service} for symbols: {symbols}")
+
+            field_type = None
+            if service == "CHART_EQUITY":
+                field_type = StreamClient.ChartEquityFields
+            elif service == "LEVELONE_EQUITIES":
+                field_type = StreamClient.LevelOneEquityFields
+            elif service in self._order_book_deltas_services.values():
+                field_type = StreamClient.BookFields
+
+            is_first_symbol_for_service = True
+            for symbol in symbols:
+                command = "SUBS" if is_first_symbol_for_service else "ADD"
+                await self._subscribe(symbol, service, command, field_type=field_type)
+                is_first_symbol_for_service = False
 
     async def disconnect(self) -> None:
         pass
@@ -228,7 +246,8 @@ class SchwabWebSocketClient:
                     )
             return
 
-        self._handler(raw)
+        for handler in self._handlers:
+            handler(raw)
 
     async def _send(self, msg: dict[str, Any]) -> None:
         await self._send_text(msgspec_json.encode(msg))

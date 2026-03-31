@@ -25,6 +25,7 @@ from nautilus_trader.adapters.schwab.data import SchwabDataClient
 from nautilus_trader.adapters.schwab.execution import SchwabExecutionClient
 from nautilus_trader.adapters.schwab.http.client import SchwabHttpClient
 from nautilus_trader.adapters.schwab.providers import SchwabInstrumentProvider
+from nautilus_trader.adapters.schwab.websocket.client import SchwabWebSocketClient
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
@@ -46,6 +47,26 @@ def get_schwab_instrument_provider(
     return SchwabInstrumentProvider(http_client, clock, config)
 
 
+_SHARED_WS_CLIENT: SchwabWebSocketClient | None = None
+
+
+def get_schwab_websocket_client(
+    clock: LiveClock,
+    http_client: SchwabHttpClient,
+    loop: asyncio.AbstractEventLoop,
+) -> SchwabWebSocketClient:
+    global _SHARED_WS_CLIENT
+    if _SHARED_WS_CLIENT is None:
+        _SHARED_WS_CLIENT = SchwabWebSocketClient(
+            clock=clock,
+            http_client=http_client,
+            handler=None,
+            handler_reconnect=None,
+            loop=loop,
+        )
+    return _SHARED_WS_CLIENT
+
+
 class SchwabLiveDataClientFactory(LiveDataClientFactory):
     """
     Factory for Schwab live data clients.
@@ -65,6 +86,8 @@ class SchwabLiveDataClientFactory(LiveDataClientFactory):
 
         http_client = get_schwab_http_client(config.http_client)
         provider = get_schwab_instrument_provider(http_client, clock, config.instrument_provider)
+        ws_client = get_schwab_websocket_client(clock, http_client, loop)
+
         return SchwabDataClient(
             loop=loop,
             msgbus=msgbus,
@@ -74,6 +97,7 @@ class SchwabLiveDataClientFactory(LiveDataClientFactory):
             instrument_provider=provider,
             config=config,
             name=name,
+            ws_client=ws_client,
         )
 
 
@@ -96,6 +120,8 @@ class SchwabLiveExecClientFactory(LiveExecClientFactory):
 
         http_client = get_schwab_http_client(config.http_client)
         provider = get_schwab_instrument_provider(http_client, clock, config.instrument_provider)
+        ws_client = get_schwab_websocket_client(clock, http_client, loop)
+
         return SchwabExecutionClient(
             loop=loop,
             msgbus=msgbus,
@@ -105,6 +131,7 @@ class SchwabLiveExecClientFactory(LiveExecClientFactory):
             instrument_provider=provider,
             config=config,
             name=name,
+            ws_client=ws_client,
         )
 
 
