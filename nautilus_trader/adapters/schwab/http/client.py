@@ -129,7 +129,15 @@ class SchwabHttpClient:
         order_spec: Mapping[str, Any],
     ) -> str:
         response = await self._client.place_order(account_hash, order_spec)
-        assert response.status_code == 201, response.raise_for_status()
+        if response.status_code != 201:
+            try:
+                response_body = response.json()
+            except Exception:  # pragma: no cover - best effort logging only
+                response_body = response.text
+            raise SchwabHttpClientError(
+                "place_order failed "
+                f"(status={response.status_code}, body={response_body!r}, order_spec={dict(order_spec)!r})",
+            )
         order_id = Utils(self._client, account_hash).extract_order_id(response)
         assert order_id is not None
         return str(order_id)
