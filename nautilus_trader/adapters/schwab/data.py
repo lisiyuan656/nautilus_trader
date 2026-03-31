@@ -18,6 +18,8 @@ import asyncio
 import copy
 import datetime as dt
 from typing import Any
+from typing import Awaitable
+from typing import Callable
 
 from msgspec import json as msgspec_json
 from schwab.client import Client
@@ -105,6 +107,7 @@ class SchwabDataClient(LiveMarketDataClient):
             handler_reconnect=None,
             loop=self._loop,
         )
+        self._ws_connected_event = asyncio.Event()
         self._ws_handlers_map = {
             "CHART_EQUITY": self._handle_chart_equity_message,
             "CHART_FUTURES": self._handle_chart_futures_message,
@@ -324,12 +327,15 @@ class SchwabDataClient(LiveMarketDataClient):
 
     async def _connect(self) -> None:
         await self._instrument_provider.initialize()
+        self._ws_connected_event.clear()
         await self._ws_client.connect()
+        self._ws_connected_event.set()
         self._send_all_instruments_to_data_engine()
 
     async def _disconnect(self) -> None:
         self._last_quotes.clear()
         self._last_trades.clear()
+        self._ws_connected_event.clear()
 
     def _handle_ws_message(self, raw: bytes) -> None:
         msg = msgspec_json.decode(raw)
@@ -348,15 +354,42 @@ class SchwabDataClient(LiveMarketDataClient):
                 if d["service"] in self._ws_handlers_map:
                     self._ws_handlers_map[d["service"]](d)
 
+    async def _wait_ws_connected(self) -> None:
+        await self._ws_connected_event.wait()
+
+    async def _ws_call_with_retry(
+        self,
+        coro: Callable[..., Awaitable[None]],
+        *args: Any,
+        retries: int = 3,
+        retry_delay: float = 0.5,
+    ) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(retries):
+            await self._wait_ws_connected()
+            try:
+                await coro(*args)
+                return
+            except RuntimeError as exc:
+                if "connection not active" not in str(exc):
+                    raise
+                last_exc = exc
+                self._log.warning(
+                    f"Schwab websocket not ready for send (attempt {attempt + 1}/{retries}). Retrying...",
+                )
+                await asyncio.sleep(retry_delay * (attempt + 1))
+        if last_exc is not None:
+            raise last_exc
+
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         symbol = command.instrument_id.symbol.value
         self._level_one_instrument_id_cache[symbol] = command.instrument_id
-        await self._ws_client.subscribe_quote_ticks(symbol)
+        await self._ws_call_with_retry(self._ws_client.subscribe_quote_ticks, symbol)
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         symbol = command.instrument_id.symbol.value
         self._level_one_instrument_id_cache.pop(symbol, None)
-        await self._ws_client.unsubscribe_quote_ticks(symbol)
+        await self._ws_call_with_retry(self._ws_client.unsubscribe_quote_ticks, symbol)
 
     async def _subscribe_trade_ticks(self, command: SubscribeTradeTicks) -> None:
         raise NotImplementedError
@@ -493,13 +526,13 @@ class SchwabDataClient(LiveMarketDataClient):
         symbol = command.bar_type.instrument_id.symbol.value
         interval_str = str(command.bar_type.spec)
         self._subscribe_bar_types[symbol] = command.bar_type
-        await self._ws_client.subscribe_klines(symbol, interval_str)
+        await self._ws_call_with_retry(self._ws_client.subscribe_klines, symbol, interval_str)
 
     async def _unsubscribe_bars(self, command: UnsubscribeBars) -> None:
         symbol = command.bar_type.instrument_id.symbol.value
         interval_str = str(command.bar_type.spec)
         self._subscribe_bar_types.pop(symbol, None)
-        await self._ws_client.unsubscribe_klines(symbol, interval_str)
+        await self._ws_call_with_retry(self._ws_client.unsubscribe_klines, symbol, interval_str)
 
     async def _subscribe_order_book_deltas(self, command: SubscribeOrderBook) -> None:
         if command.book_type != BookType.L2_MBP:
@@ -525,7 +558,7 @@ class SchwabDataClient(LiveMarketDataClient):
             return
 
         self._order_book_deltas_instrument_id_cache[symbol] = command.instrument_id
-        await self._ws_client.subscribe_order_book_deltas(symbol, venue)
+        await self._ws_call_with_retry(self._ws_client.subscribe_order_book_deltas, symbol, venue)
 
     async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
         symbol = command.instrument_id.symbol.value
@@ -545,7 +578,7 @@ class SchwabDataClient(LiveMarketDataClient):
             return
 
         self._order_book_deltas_instrument_id_cache.pop(symbol, None)
-        await self._ws_client.unsubscribe_order_book_deltas(symbol, venue)
+        await self._ws_call_with_retry(self._ws_client.unsubscribe_order_book_deltas, symbol, venue)
 
     def _send_all_instruments_to_data_engine(self) -> None:
         instruments = self._instrument_provider.get_all().values()
