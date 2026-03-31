@@ -29,9 +29,11 @@ dependencies = [
   "msgspec>=0.20.0,<1.0.0",
   "numpy>=1.26.4",
   "pandas>=2.3.3,<3.0.0",
+  "pandas-market-calendars>=5.3.1.2",
   "portion>=2.6.1",
   "pyarrow>=23.0.1",
   "pytz>=2026.1.0",
+  "schwab-py>=1.5.0",
   "tqdm>=4.67.3,<5.0.0",
   "uvloop==0.22.1,<1.0.0; sys_platform != \"win32\"", # Pinned to 0.22.1 for stability
 ]

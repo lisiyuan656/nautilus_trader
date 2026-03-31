@@ -100,12 +100,13 @@ class SchwabHttpClient:
         positions = securities_account.get("positions", [])
         if isinstance(positions, list):
             return [pos for pos in positions if isinstance(pos, Mapping)]
+        return []
 
     async def get_orders_for_account(
         self,
         account_hash: str | None,
-        from_entered_datetime=None,
-        to_entered_datetime=None,
+        from_entered_datetime: Any | None = None,
+        to_entered_datetime: Any | None = None,
     ) -> list[Mapping[str, Any]]:
         response = await self._client.get_orders_for_account(
             account_hash,
@@ -155,14 +156,14 @@ class SchwabHttpClient:
     async def get_price_history(
         self,
         symbol: str,
-        period_type=None,
-        period=None,
-        frequency_type=None,
-        frequency=None,
-        start_datetime=None,
-        end_datetime=None,
-        need_extended_hours_data=None,
-        need_previous_close=None,
+        period_type: Any | None = None,
+        period: Any | None = None,
+        frequency_type: Any | None = None,
+        frequency: Any | None = None,
+        start_datetime: Any | None = None,
+        end_datetime: Any | None = None,
+        need_extended_hours_data: bool | None = None,
+        need_previous_close: bool | None = None,
     ) -> Mapping[str, Any]:
         response = await self._client.get_price_history(
             symbol,
@@ -237,4 +238,4 @@ class SchwabHttpClient:
         return http_client
 
 
-__all__ = ["SchwabRESTClient", "SchwabRESTClientError", "create_schwab_client"]
+__all__ = ["SchwabHttpClient", "SchwabHttpClientError"]
