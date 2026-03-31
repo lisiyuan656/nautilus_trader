@@ -318,6 +318,26 @@ impl HyperliquidHttpClient {
         })
     }
 
+    /// Update leverage for a perpetual instrument on the Hyperliquid exchange.
+    #[pyo3(name = "update_leverage", signature = (instrument_id, leverage, is_cross=true))]
+    fn py_update_leverage<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        leverage: u32,
+        is_cross: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .update_leverage(instrument_id, leverage, is_cross)
+                .await
+                .map_err(to_pyvalue_err)?;
+            Ok(())
+        })
+    }
+
     /// Cancel an order on the Hyperliquid exchange.
     ///
     /// Can cancel either by venue order ID or client order ID.

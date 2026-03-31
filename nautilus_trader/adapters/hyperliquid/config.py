@@ -92,6 +92,12 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
         dynamic constraint that depends on the price magnitude and cannot be fully encoded
         in the static instrument tick size. When enabled, prices are automatically rounded
         to comply with this rule. Disable if you want full control over price formatting.
+    startup_leverage : PositiveInt, optional
+        If provided, updates the leverage on each configured perpetual instrument during
+        client startup before live trading begins.
+    startup_is_cross : bool, default True
+        Whether the startup leverage should use cross margin. Set to ``False`` to use
+        isolated margin.
 
     Warnings
     --------
@@ -111,3 +117,5 @@ class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
     retry_delay_max_ms: PositiveInt | None = None
     http_timeout_secs: PositiveInt = 10
     normalize_prices: bool = True
+    startup_leverage: PositiveInt | None = None
+    startup_is_cross: bool = True

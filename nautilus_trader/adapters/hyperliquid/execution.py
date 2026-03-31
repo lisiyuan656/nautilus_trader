@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
@@ -200,6 +201,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             LogColor.GREEN,
         )
 
+        await self._apply_startup_leverage()
         await self._update_account_state()
         await self._await_account_registered()
 
@@ -223,6 +225,143 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 LogColor.BLUE,
             )
 
+    async def _apply_startup_leverage(self) -> None:
+        leverage = self._config.startup_leverage
+        if leverage is None:
+            return
+
+        update_leverage = getattr(self._client, "update_leverage", None)
+        if not callable(update_leverage):
+            raise RuntimeError(
+                "HyperliquidHttpClient does not expose update_leverage; rebuild nautilus_pyo3 "
+                "before using startup_leverage",
+            )
+
+        perp_instruments: list = []
+        seen_symbols: set[str] = set()
+        for instrument in self._instrument_provider.list_all():
+            symbol = instrument.id.symbol.value
+            if not symbol.endswith("-PERP") or symbol in seen_symbols:
+                continue
+            perp_instruments.append(instrument)
+            seen_symbols.add(symbol)
+
+        if not perp_instruments:
+            self._log.warning(
+                f"startup_leverage={leverage} configured, but no perpetual instruments were loaded",
+            )
+            return
+
+        metadata_by_symbol = await self._load_startup_leverage_metadata(
+            [instrument.id.symbol.value for instrument in perp_instruments],
+        )
+        margin_mode = "cross" if self._config.startup_is_cross else "isolated"
+        applied = 0
+        for instrument in perp_instruments:
+            instrument_id = instrument.id
+            symbol = instrument_id.symbol.value
+            skip_reason = self._get_startup_leverage_skip_reason(
+                symbol=symbol,
+                metadata=metadata_by_symbol.get(symbol),
+                leverage=int(leverage),
+                is_cross=self._config.startup_is_cross,
+            )
+            if skip_reason is not None:
+                self._log.warning(
+                    f"Skipping startup leverage for {instrument_id}: {skip_reason}",
+                )
+                continue
+
+            self._log.info(
+                f"Setting {instrument_id} leverage to {leverage}x ({margin_mode})",
+                LogColor.BLUE,
+            )
+            try:
+                pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(str(instrument_id))
+                await update_leverage(
+                    pyo3_instrument_id,
+                    int(leverage),
+                    self._config.startup_is_cross,
+                )
+            except Exception as e:
+                self._log.warning(
+                    f"Skipping startup leverage for {instrument_id}: venue rejected update ({e})",
+                )
+                continue
+
+            applied += 1
+
+        if applied == 0:
+            self._log.warning(
+                f"startup_leverage={leverage} configured, but no loaded perps accepted the requested "
+                f"{margin_mode} leverage",
+            )
+
+    @staticmethod
+    def _extract_perp_dex(symbol: str) -> str | None:
+        base = symbol.removesuffix("-USD-PERP")
+        if ":" not in base:
+            return None
+        return base.split(":", maxsplit=1)[0]
+
+    @staticmethod
+    def _get_startup_leverage_skip_reason(
+        symbol: str,
+        metadata: dict[str, Any] | None,
+        leverage: int,
+        is_cross: bool,
+    ) -> str | None:
+        if metadata is None:
+            return "venue metadata unavailable for startup leverage check"
+
+        if not metadata.get("active", True):
+            return "instrument is inactive or delisted"
+
+        if is_cross and metadata.get("only_isolated", False):
+            return "instrument only supports isolated margin"
+
+        max_leverage = metadata.get("max_leverage")
+        if max_leverage is not None and leverage > max_leverage:
+            return f"requested leverage {leverage}x exceeds venue max {max_leverage}x"
+
+        return None
+
+    async def _load_startup_leverage_metadata(
+        self,
+        symbols: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        get_perp_meta = getattr(self._client, "get_perp_meta", None)
+        if not callable(get_perp_meta):
+            self._log.warning(
+                "HyperliquidHttpClient does not expose get_perp_meta, "
+                "startup leverage pre-checks will be skipped",
+            )
+            return {}
+
+        dexes: set[str | None] = {self._extract_perp_dex(symbol) for symbol in symbols}
+        metadata_by_symbol: dict[str, dict[str, Any]] = {}
+        for dex in sorted(dexes, key=lambda value: (value is not None, value or "")):
+            try:
+                raw_meta = await get_perp_meta(dex)
+                parsed = json.loads(raw_meta)
+            except Exception as e:
+                scope = dex or "core"
+                self._log.warning(
+                    f"Could not load Hyperliquid perp metadata for {scope} startup leverage checks: {e}",
+                )
+                continue
+
+            for asset in parsed.get("universe", []):
+                name = asset.get("name")
+                if not name:
+                    continue
+                metadata_by_symbol[f"{name}-USD-PERP"] = {
+                    "active": not bool(asset.get("isDelisted", False)),
+                    "only_isolated": bool(asset.get("onlyIsolated", False)),
+                    "max_leverage": asset.get("maxLeverage"),
+                }
+
+        return metadata_by_symbol
     def _sync_cloid_cache(self) -> None:
         orders = self._cache.orders(venue=self.venue)
         if not orders:

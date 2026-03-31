@@ -1404,6 +1404,56 @@ impl HyperliquidHttpClient {
         self.inner.post_action_exec(action).await
     }
 
+    /// Update leverage for a perpetual instrument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument is not a perpetual contract, the
+    /// asset index is not cached, the leverage is invalid, or the API returns
+    /// an error response.
+    pub async fn update_leverage(
+        &self,
+        instrument_id: InstrumentId,
+        leverage: u32,
+        is_cross: bool,
+    ) -> Result<()> {
+        if leverage == 0 {
+            return Err(Error::bad_request("Leverage must be greater than zero"));
+        }
+
+        let symbol = instrument_id.symbol.as_str();
+        let product_type = HyperliquidProductType::from_symbol(symbol)
+            .map_err(|_| Error::bad_request(format!("Unsupported Hyperliquid symbol: {symbol}")))?;
+
+        if product_type != HyperliquidProductType::Perp {
+            return Err(Error::bad_request(format!(
+                "Leverage can only be updated for perpetual instruments: {symbol}"
+            )));
+        }
+
+        let asset = self.get_asset_index(symbol).ok_or_else(|| {
+            Error::bad_request(format!(
+                "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
+            ))
+        })?;
+
+        let action = ExchangeAction::update_leverage(asset, is_cross, leverage);
+        let response = self.inner.post_action(&action).await?;
+
+        match response {
+            ref r @ HyperliquidExchangeResponse::Status { .. } if r.is_ok() => Ok(()),
+            HyperliquidExchangeResponse::Status {
+                status,
+                response: error_data,
+            } => Err(Error::bad_request(format!(
+                "Update leverage failed: status={status}, error={error_data}"
+            ))),
+            HyperliquidExchangeResponse::Error { error } => Err(Error::bad_request(format!(
+                "Update leverage error: {error}"
+            ))),
+        }
+    }
+
     /// Get metadata about available markets (low-level delegation).
     pub async fn info_meta(&self) -> Result<HyperliquidMeta> {
         self.inner.info_meta().await

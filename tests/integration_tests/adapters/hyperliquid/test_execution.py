@@ -132,6 +132,7 @@ async def test_connect_success(exec_client_builder, monkeypatch):
         # Assert
         instrument_provider.initialize.assert_awaited_once()
         http_client.request_account_state.assert_awaited_once()
+        http_client.update_leverage.assert_not_awaited()
         ws_client.connect.assert_awaited_once()
         ws_client.subscribe_order_updates.assert_awaited_once()
         ws_client.subscribe_user_events.assert_awaited_once()
@@ -140,6 +141,105 @@ async def test_connect_success(exec_client_builder, monkeypatch):
 
     # Assert
     ws_client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_connect_applies_startup_leverage_to_loaded_perps(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, ws_client, http_client, instrument_provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "startup_leverage": 1,
+            "startup_is_cross": False,
+        },
+    )
+
+    instrument_ids = [instrument.id for instrument in instrument_provider.list_all.return_value]
+    http_client.get_perp_meta.return_value = """
+    {
+      "universe": [
+        {"name": "BTC", "maxLeverage": 25, "onlyIsolated": false, "isDelisted": false},
+        {"name": "ETH", "maxLeverage": 25, "onlyIsolated": false, "isDelisted": false}
+      ]
+    }
+    """
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        assert http_client.update_leverage.await_count == 2
+        awaited_calls = http_client.update_leverage.await_args_list
+        assert str(awaited_calls[0].args[0]) == str(instrument_ids[0])
+        assert awaited_calls[0].args[1:] == (1, False)
+        assert str(awaited_calls[1].args[0]) == str(instrument_ids[1])
+        assert awaited_calls[1].args[1:] == (1, False)
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_skips_unsupported_startup_leverage_perps(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, ws_client, http_client, instrument_provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "startup_leverage": 10,
+            "startup_is_cross": True,
+        },
+    )
+    http_client.get_perp_meta.return_value = """
+    {
+      "universe": [
+        {"name": "BTC", "maxLeverage": 5, "onlyIsolated": false, "isDelisted": false},
+        {"name": "ETH", "maxLeverage": 25, "onlyIsolated": true, "isDelisted": false}
+      ]
+    }
+    """
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        http_client.update_leverage.assert_not_awaited()
+        ws_client.connect.assert_awaited_once()
+        http_client.request_account_state.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_skips_startup_leverage_without_metadata(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, ws_client, http_client, _ = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "startup_leverage": 1,
+            "startup_is_cross": True,
+        },
+    )
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        http_client.update_leverage.assert_not_awaited()
+        ws_client.connect.assert_awaited_once()
+        http_client.request_account_state.assert_awaited_once()
+    finally:
+        await client._disconnect()
 
 
 @pytest.mark.asyncio

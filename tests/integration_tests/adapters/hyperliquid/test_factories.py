@@ -72,6 +72,8 @@ class TestHyperliquidExecClientConfig:
         assert config.vault_address is None
         assert config.testnet is False
         assert config.http_timeout_secs == 10
+        assert config.startup_leverage is None
+        assert config.startup_is_cross is True
 
     def test_with_private_key(self):
         # Arrange & Act
@@ -135,6 +137,17 @@ class TestHyperliquidExecClientConfig:
 
         # Assert
         assert config.base_url_ws == "wss://custom.ws.com"
+
+    def test_with_startup_leverage(self):
+        # Arrange & Act
+        config = HyperliquidExecClientConfig(
+            startup_leverage=1,
+            startup_is_cross=False,
+        )
+
+        # Assert
+        assert config.startup_leverage == 1
+        assert config.startup_is_cross is False
 
 
 class TestConfigValidation:

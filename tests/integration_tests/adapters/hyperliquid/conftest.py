@@ -189,12 +189,14 @@ def mock_http_client():
     mock.submit_order = AsyncMock()
     mock.submit_order_from_order_any = AsyncMock()
     mock.submit_orders = AsyncMock(return_value=[])
+    mock.update_leverage = AsyncMock()
     mock.modify_order = AsyncMock()
     mock.cancel_order = AsyncMock()
 
     mock.info_meta = AsyncMock(return_value=MagicMock())
     mock.info_l2_book = AsyncMock(return_value=MagicMock())
     mock.info_clearinghouse_state = AsyncMock(return_value={})
+    mock.get_perp_meta = AsyncMock(return_value='{"universe":[]}')
 
     return mock
 
