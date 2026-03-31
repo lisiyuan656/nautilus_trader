@@ -144,6 +144,32 @@ class SchwabHttpClient:
         response.raise_for_status()
         return response
 
+    async def get_price_history(
+        self,
+        symbol: str,
+        period_type=None,
+        period=None,
+        frequency_type=None,
+        frequency=None,
+        start_datetime=None,
+        end_datetime=None,
+        need_extended_hours_data=None,
+        need_previous_close=None,
+    ) -> Mapping[str, Any]:
+        response = await self._client.get_price_history(
+            symbol,
+            period_type=period_type,
+            period=period,
+            frequency_type=frequency_type,
+            frequency=frequency,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            need_extended_hours_data=need_extended_hours_data,
+            need_previous_close=need_previous_close,
+        )
+        response.raise_for_status()
+        return response.json()
+
     # async def _call_async(self, candidates: Sequence[str], *args: Any, **kwargs: Any) -> Any:
     #     func = self._resolve_callable(candidates)
     #     return await asyncio.to_thread(func, *args, **kwargs)

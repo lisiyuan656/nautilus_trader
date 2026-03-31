@@ -20,6 +20,7 @@ import datetime as dt
 from typing import Any
 
 from msgspec import json as msgspec_json
+from schwab.client import Client
 from schwab.streaming import StreamClient
 
 from nautilus_trader.adapters.schwab.common import SCHWAB_VENUE
@@ -32,6 +33,7 @@ from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.datetime import millis_to_nanos
+from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.data.messages import RequestQuoteTicks
 from nautilus_trader.data.messages import RequestTradeTicks
 from nautilus_trader.data.messages import SubscribeBars
@@ -367,6 +369,125 @@ class SchwabDataClient(LiveMarketDataClient):
 
     async def _request_trade_ticks(self, request: RequestTradeTicks) -> None:
         raise NotImplementedError
+
+    async def _request_bars(self, request: RequestBars) -> None:
+        symbol = request.bar_type.instrument_id.symbol.value
+        instrument = self._cache.instrument(request.bar_type.instrument_id)
+        if instrument is None:
+            self._log.error(f"Instrument not found for {request.bar_type.instrument_id}")
+            return
+
+        # Determine frequency and frequency_type based on bar_type.spec.timedelta
+        td = request.bar_type.spec.timedelta
+
+        period_type = Client.PriceHistory.PeriodType.DAY
+        period = Client.PriceHistory.Period.ONE_DAY
+        if td == dt.timedelta(minutes=1):
+            frequency_type = Client.PriceHistory.FrequencyType.MINUTE
+            frequency = Client.PriceHistory.Frequency.EVERY_MINUTE
+        elif td == dt.timedelta(minutes=5):
+            frequency_type = Client.PriceHistory.FrequencyType.MINUTE
+            frequency = Client.PriceHistory.Frequency.EVERY_FIVE_MINUTES
+        elif td == dt.timedelta(minutes=10):
+            frequency_type = Client.PriceHistory.FrequencyType.MINUTE
+            frequency = Client.PriceHistory.Frequency.EVERY_TEN_MINUTES
+        elif td == dt.timedelta(minutes=15):
+            frequency_type = Client.PriceHistory.FrequencyType.MINUTE
+            frequency = Client.PriceHistory.Frequency.EVERY_FIFTEEN_MINUTES
+        elif td == dt.timedelta(minutes=30):
+            frequency_type = Client.PriceHistory.FrequencyType.MINUTE
+            frequency = Client.PriceHistory.Frequency.EVERY_THIRTY_MINUTES
+        elif td == dt.timedelta(days=1):
+            frequency_type = Client.PriceHistory.FrequencyType.DAILY
+            frequency = Client.PriceHistory.Frequency.DAILY
+            period_type = Client.PriceHistory.PeriodType.YEAR
+            period = Client.PriceHistory.Period.TWENTY_YEARS
+        elif td == dt.timedelta(weeks=1):
+            frequency_type = Client.PriceHistory.FrequencyType.WEEKLY
+            frequency = Client.PriceHistory.Frequency.WEEKLY
+            period_type = Client.PriceHistory.PeriodType.YEAR
+            period = Client.PriceHistory.Period.TWENTY_YEARS
+        else:
+            self._log.error(f"Unsupported bar interval {td} for Schwab request bars.")
+            return
+
+        # Schwab expects defaults for period even if start/end are provided
+        # period_type = Client.PriceHistory.PeriodType.DAY
+        # period = Client.PriceHistory.Period.ONE_DAY
+
+        # Convert timestamps to datetime
+        if isinstance(request.start, int):
+            start_dt = dt.datetime.fromtimestamp(request.start / 1e9, tz=dt.timezone.utc)
+        else:
+            start_dt = request.start.floor("us").to_pydatetime()
+
+        if isinstance(request.end, int):
+            end_dt = dt.datetime.fromtimestamp(request.end / 1e9, tz=dt.timezone.utc)
+        else:
+            end_dt = request.end.floor("us").to_pydatetime()
+
+        self._log.info(
+            f"Requesting bars for {symbol} "
+            f"start={start_dt} end={end_dt} "
+            f"freq_type={frequency_type} freq={frequency}",
+        )
+
+        try:
+            response = await self._http_client.get_price_history(
+                symbol=symbol,
+                period_type=period_type,
+                period=period,
+                frequency_type=frequency_type,
+                frequency=frequency,
+                start_datetime=start_dt,
+                end_datetime=end_dt,
+                need_extended_hours_data=True,
+                need_previous_close=False,
+            )
+        except Exception as e:
+            self._log.error(f"Failed to request bars for {symbol}: {e}")
+            return
+
+        self._log.debug(f"Received bar response for {symbol}: keys={list(response.keys())}")
+
+        if "candles" not in response:
+            if response.get("empty", False):
+                self._log.info(f"Empty bar response for {symbol}")
+                return
+            self._log.warning(f"No candles in response for {symbol}: {response}")
+            return
+
+        candles = response["candles"]
+        self._log.info(f"Received {len(candles)} bars for {symbol}")
+
+        bars = []
+        for candle in candles:
+            ts_event = millis_to_nanos(candle["datetime"])
+
+            if self._bars_timestamp_on_close:
+                interval_ms = td / dt.timedelta(milliseconds=1)
+                ts_event += millis_to_nanos(interval_ms)
+
+            bar = Bar(
+                bar_type=request.bar_type,
+                open=Price(candle["open"], instrument.price_precision),
+                high=Price(candle["high"], instrument.price_precision),
+                low=Price(candle["low"], instrument.price_precision),
+                close=Price(candle["close"], instrument.price_precision),
+                volume=Quantity(candle["volume"], instrument.size_precision),
+                ts_event=ts_event,
+                ts_init=self._clock.timestamp_ns(),
+            )
+            bars.append(bar)
+
+        self._handle_bars(
+            bar_type=request.bar_type,
+            bars=bars,
+            correlation_id=request.id,
+            start=request.start,
+            end=request.end,
+            params=request.params,
+        )
 
     async def _subscribe_bars(self, command: SubscribeBars) -> None:
         symbol = command.bar_type.instrument_id.symbol.value
