@@ -46,8 +46,15 @@ class SchwabWebSocketClient:
         self._clock = clock
         self._log: Logger = Logger(type(self).__name__)
         self._http_client = http_client
-        self._handler: Callable[[bytes], None] = handler
-        self._handler_reconnect: Callable[..., Awaitable[None]] | None = handler_reconnect
+
+        self._handlers: list[Callable[[bytes], None]] = []
+        if handler:
+            self._handlers.append(handler)
+
+        self._reconnect_handlers: list[Callable[..., Awaitable[None]]] = []
+        if handler_reconnect:
+            self._reconnect_handlers.append(handler_reconnect)
+
         self._loop = loop
         self._tasks: WeakSet[asyncio.Task] = WeakSet()
         self._client: WebSocketClient | None = None
@@ -68,6 +75,12 @@ class SchwabWebSocketClient:
         }
         self._ws_auth_timeout_secs = 5.0
         self._account_activity_service = "ACCT_ACTIVITY"
+
+        # Watchdog configuration
+        self._last_msg_ts: int | None = None
+        self._connection_monitor_task: asyncio.Task | None = None
+        self._monitor_interval_secs: int = 2
+        self._connection_timeout_secs: int = 15  # More aggressive timeout
 
     def register_handler(self, handler: Callable[[bytes], None]) -> None:
         if handler not in self._handlers:
@@ -100,24 +113,56 @@ class SchwabWebSocketClient:
             url=self._base_url,
             headers=[],
         )
+        self._log.info(f"Opening Schwab websocket to {self._base_url}", LogColor.BLUE)
         self._client = await WebSocketClient.connect(
             loop_=self._loop,
             config=config,
             handler=self._msg_handler,
         )
+        self._log.info("Schwab websocket transport opened", LogColor.BLUE)
 
     async def connect(self) -> None:
         """
         Connect websocket clients to the server based on existing subscriptions.
         """
         # Recreate the http client in case the token is updated
+        self._log.info("Initializing Schwab streaming session", LogColor.BLUE)
         http_client = self._http_client.create_schwab_client()
-        r = await http_client.get_user_preferences()
-        assert r.status_code == 200, r.raise_for_status()
-        r = r.json()
-        await self._init_from_preferences(r)
+        self._log.info("Requesting Schwab user preferences for streamer session", LogColor.BLUE)
+        try:
+            response = await http_client.get_user_preferences()
+        except Exception as exc:
+            self._log.exception("Failed to request Schwab user preferences", exc)
+            raise RuntimeError("Schwab streaming setup failed at get_user_preferences") from exc
+
+        try:
+            assert response.status_code == 200, response.raise_for_status()
+            prefs = response.json()
+        except Exception as exc:
+            self._log.exception("Failed to decode Schwab user preferences response", exc)
+            raise RuntimeError("Schwab streaming setup failed parsing user preferences") from exc
+
+        self._log.info("Received Schwab user preferences", LogColor.BLUE)
+        try:
+            await self._init_from_preferences(prefs)
+        except Exception as exc:
+            self._log.exception("Failed to open Schwab websocket transport", exc)
+            raise RuntimeError("Schwab streaming setup failed opening websocket") from exc
+
         self._log.info(f"Connected to {self._base_url}", LogColor.BLUE)
-        await self._authenticate(http_client.token_metadata.token["access_token"])
+        self._log.info("Authenticating Schwab websocket session", LogColor.BLUE)
+        try:
+            await self._authenticate(http_client.token_metadata.token["access_token"])
+        except Exception as exc:
+            self._log.exception("Failed to authenticate Schwab websocket session", exc)
+            raise RuntimeError("Schwab streaming setup failed during websocket login") from exc
+
+        self._log.info("Schwab websocket session authenticated", LogColor.BLUE)
+
+        # Start connection monitor
+        if self._connection_monitor_task is None:
+            self._connection_monitor_task = self._loop.create_task(self._connection_monitor())
+            self._tasks.add(self._connection_monitor_task)
 
     async def reconnect(self) -> None:
         """
@@ -127,6 +172,35 @@ class SchwabWebSocketClient:
         await self._subscribe_all()
         for handler in self._reconnect_handlers:
             await handler()
+
+    async def _connection_monitor(self) -> None:
+        self._log.info("Starting connection monitor.")
+        connection_timeout_ns = self._connection_timeout_secs * 1_000_000_000
+
+        while True:
+            await asyncio.sleep(self._monitor_interval_secs)
+
+            if not self._is_authenticated or self._client is None:
+                continue
+
+            if self._last_msg_ts is None:
+                self._last_msg_ts = self._clock.timestamp_ns()
+                continue
+
+            time_since_last_msg_ns = self._clock.timestamp_ns() - self._last_msg_ts
+            if time_since_last_msg_ns > connection_timeout_ns:
+                self._log.warning(
+                    f"No message received for {time_since_last_msg_ns / 1e9:.2f} seconds. "
+                    "Reconnecting...",
+                )
+                try:
+                    # Reset timer before reconnecting to avoid multiple reconnects
+                    self._last_msg_ts = self._clock.timestamp_ns()
+                    await self.reconnect()
+                except Exception as e:
+                    self._log.error(f"Failed to reconnect: {e}")
+                    # Wait before retrying
+                    await asyncio.sleep(self._monitor_interval_secs)
 
     async def _subscribe_all(self) -> None:
         self._log.info("Re-subscribing to all previously subscribed services...")
@@ -149,6 +223,7 @@ class SchwabWebSocketClient:
             elif service in self._order_book_deltas_services.values():
                 field_type = StreamClient.BookFields
 
+            # Correctly handle SUBS for the first symbol and ADD for subsequent ones
             is_first_symbol_for_service = True
             for symbol in symbols:
                 command = "SUBS" if is_first_symbol_for_service else "ADD"
@@ -185,11 +260,19 @@ class SchwabWebSocketClient:
             command="LOGIN",
             parameters=request_parameters,
         )
+        self._log.info(
+            f"Sending Schwab websocket LOGIN request {request_id}",
+            LogColor.BLUE,
+        )
         try:
             await self._send({"requests": [request]})
             await asyncio.wait_for(
                 self._auth_event.wait(),
                 timeout=self._ws_auth_timeout_secs,
+            )
+            self._log.info(
+                f"Schwab websocket LOGIN request {request_id} acknowledged",
+                LogColor.BLUE,
             )
         except TimeoutError:
             self._log.warning("Websocket client authentication timeout")
@@ -217,6 +300,7 @@ class SchwabWebSocketClient:
             The received message in bytes.
 
         """
+        self._last_msg_ts = self._clock.timestamp_ns()
         msg = msgspec_json.decode(raw)
 
         if (
