@@ -637,7 +637,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
             cloid = nautilus_pyo3.hyperliquid_cloid_from_client_order_id(pyo3_client_order_id)
             self._ws_client.cache_cloid_mapping(cloid, pyo3_client_order_id)
 
-            await self._client.submit_order(
+            pyo3_report = await self._client.submit_order(
                 instrument_id=pyo3_instrument_id,
                 client_order_id=pyo3_client_order_id,
                 order_side=pyo3_order_side,
@@ -649,6 +649,8 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 post_only=order.is_post_only,
                 reduce_only=order.is_reduce_only,
             )
+
+            await self._handle_submit_order_report(order, pyo3_report)
         except Exception as e:
             error_str = str(e)
             due_post_only = HYPERLIQUID_POST_ONLY_WOULD_MATCH in error_str
@@ -668,6 +670,17 @@ class HyperliquidExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
                 due_post_only=due_post_only,
             )
+
+    async def _handle_submit_order_report(
+        self,
+        order: Any,
+        pyo3_report: nautilus_pyo3.OrderStatusReport,
+    ) -> None:
+        self._handle_order_status_report_pyo3(pyo3_report)
+
+        report = OrderStatusReport.from_pyo3(pyo3_report)
+        if report.order_status == OrderStatus.FILLED and report.venue_order_id is not None:
+            await self._request_and_process_fills_for_order(order, report.venue_order_id)
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         order_list = command.order_list
