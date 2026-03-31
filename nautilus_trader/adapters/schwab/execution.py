@@ -159,6 +159,7 @@ class SchwabExecutionClient(LiveExecutionClient):
         instrument_provider: SchwabInstrumentProvider,
         config: SchwabExecClientConfig,
         name: str | None = None,
+        ws_client: SchwabWebSocketClient | None = None,
     ) -> None:
         super().__init__(
             loop=loop,
@@ -181,13 +182,19 @@ class SchwabExecutionClient(LiveExecutionClient):
         self._venue_order_to_client: dict[VenueOrderId, ClientOrderId] = {}
         self._open_orders: dict[VenueOrderId, Mapping[str, Any]] = {}
         self._account_hash: str | None = None
-        self._ws_client = SchwabWebSocketClient(
-            clock=clock,
-            http_client=http_client,
-            handler=self._handle_ws_message,
-            handler_reconnect=self._handle_ws_reconnected,
-            loop=loop,
-        )
+
+        if ws_client:
+            self._ws_client = ws_client
+            self._ws_client.register_handler(self._handle_ws_message)
+            self._ws_client.register_reconnect_handler(self._handle_ws_reconnected)
+        else:
+            self._ws_client = SchwabWebSocketClient(
+                clock=clock,
+                http_client=http_client,
+                handler=self._handle_ws_message,
+                handler_reconnect=self._handle_ws_reconnected,
+                loop=loop,
+            )
         self._ws_connected = False
         self._recent_stream_trade_ids: deque[str] = deque()
         self._recent_stream_trade_ids_set: set[str] = set()
@@ -318,7 +325,13 @@ class SchwabExecutionClient(LiveExecutionClient):
             self._client_order_to_venue[order.client_order_id] = venue_order
             self._venue_order_to_client[venue_order] = order.client_order_id
             order_status = await self._http_client.get_order(venue_order_id, self._account_hash)
-            if order_status["status"] in ["WORKING", "PENDING_ACTIVATION", "FILLED", "QUEUED", "ACCEPTED"]:
+            if order_status["status"] in [
+                "WORKING",
+                "PENDING_ACTIVATION",
+                "FILLED",
+                "QUEUED",
+                "ACCEPTED",
+            ]:
                 self.generate_order_accepted(
                     strategy_id=order.strategy_id,
                     instrument_id=order.instrument_id,
@@ -337,7 +350,7 @@ class SchwabExecutionClient(LiveExecutionClient):
                             instrument_id=order.instrument_id,
                             venue_order_id=venue_order,
                             client_order_id=order.client_order_id,
-                            order_side=order.side, # Use original order side as fallback/context
+                            order_side=order.side,  # Use original order side as fallback/context
                         )
                         if report:
                             self.generate_order_filled(
@@ -369,7 +382,7 @@ class SchwabExecutionClient(LiveExecutionClient):
         positions = self._cache.positions(
             instrument_id=order.instrument_id,
         )
-        
+
         current_position = None
         for p in positions:
             if not p.is_closed:
@@ -1154,7 +1167,9 @@ class SchwabExecutionClient(LiveExecutionClient):
 
         order = self._cache.order(client_order_id)
         if order is None:
-            self._log.debug(f"Skipping account activity: order {client_order_id} missing from cache")
+            self._log.debug(
+                f"Skipping account activity: order {client_order_id} missing from cache"
+            )
             return
 
         instrument_id = self._infer_instrument_id(order_data) or order.instrument_id
@@ -1292,7 +1307,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             ).upper(),
             OrderStatus.ACCEPTED,
         )
-        
+
         filled_qty = float(order_data.get("filledQuantity", 0.0))
         total_qty = float(order_data.get("quantity", 0.0))
 
@@ -1395,13 +1410,13 @@ class SchwabExecutionClient(LiveExecutionClient):
     def _parse_avg_price(self, order_data: Mapping[str, Any]) -> float:
         total_value = 0.0
         total_qty = 0.0
-        
+
         activities = order_data.get("orderActivityCollection")
         if isinstance(activities, list):
             for activity in activities:
                 if activity.get("activityType") != "EXECUTION":
                     continue
-                
+
                 # Skip cancellations/rejections if they appear in activity collection
                 if activity.get("executionType") in ("CANCELED", "REJECTED", "EXPIRED"):
                     continue
@@ -1414,7 +1429,7 @@ class SchwabExecutionClient(LiveExecutionClient):
                         if qty > 0:
                             total_value += price * qty
                             total_qty += qty
-                            
+
         return total_value / total_qty if total_qty > 0 else 0.0
 
     def _parse_order_side(self, order_data: Mapping[str, Any]) -> OrderSide:
