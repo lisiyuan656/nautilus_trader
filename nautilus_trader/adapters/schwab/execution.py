@@ -19,6 +19,7 @@ import copy
 import json
 from collections import deque
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
@@ -43,6 +44,9 @@ from nautilus_trader.adapters.schwab.http.error import SchwabError
 from nautilus_trader.adapters.schwab.http.error import should_retry
 from nautilus_trader.adapters.schwab.providers import SchwabInstrumentProvider
 from nautilus_trader.adapters.schwab.websocket.client import SchwabWebSocketClient
+from nautilus_trader.cache.cache import Cache
+from nautilus_trader.common.component import LiveClock
+from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
@@ -62,7 +66,6 @@ from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.retry import RetryManagerPool
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AccountType
-from nautilus_trader.model.enums import ContingencyType
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
@@ -280,7 +283,6 @@ class SchwabExecutionClient(LiveExecutionClient):
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         order = command.order
-        instrument = self._cache.instrument(order.instrument_id)
 
         self._client_order_to_instrument[order.client_order_id] = order.instrument_id
 
@@ -691,7 +693,7 @@ class SchwabExecutionClient(LiveExecutionClient):
         )
         return report
 
-    async def generate_order_status_reports(
+    async def generate_order_status_reports(  # noqa: C901
         self,
         command: GenerateOrderStatusReports,
     ) -> list[OrderStatusReport]:
@@ -774,7 +776,7 @@ class SchwabExecutionClient(LiveExecutionClient):
                 reports.append(report)
         return reports
 
-    async def generate_fill_reports(
+    async def generate_fill_reports(  # noqa: C901
         self,
         command: GenerateFillReports,
     ) -> list[FillReport]:
@@ -876,7 +878,7 @@ class SchwabExecutionClient(LiveExecutionClient):
 
         return reports
 
-    async def generate_position_status_reports(
+    async def generate_position_status_reports(  # noqa: C901
         self,
         command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
@@ -907,9 +909,13 @@ class SchwabExecutionClient(LiveExecutionClient):
         instruments = []
         for position in positions:
             instrument_info = position.get("instrument")
+            if not isinstance(instrument_info, Mapping):
+                continue
             symbol = instrument_info.get("symbol")
             asset_type = instrument_info.get("assetType", "EQUITY")
-            instrument_id = self._instrument_id_from_symbol(symbol, asset_type)
+            if not symbol:
+                continue
+            instrument_id = self._instrument_id_from_symbol(str(symbol), str(asset_type))
             instruments.append(instrument_id)
         await self._ensure_instruments_loaded(instruments)
 
@@ -1021,10 +1027,8 @@ class SchwabExecutionClient(LiveExecutionClient):
         fill_time = fill.get("time") or fill.get("executionTime")
 
         if fill_time:
-            try:
+            with suppress(TypeError, ValueError):
                 ts_event = int(pd.to_datetime(fill_time, utc=True).value)
-            except (TypeError, ValueError):
-                pass
 
         execution_id = fill.get("executionId")
         leg_id = fill.get("legId")
@@ -1120,8 +1124,10 @@ class SchwabExecutionClient(LiveExecutionClient):
                 continue
             try:
                 StreamClient.AccountActivityFields.relabel_message(entry, labeled_content[idx])
-            except Exception:
-                continue
+            except Exception as exc:
+                self._log.debug(
+                    f"Unable to relabel account activity entry {idx}: {exc}",
+                )
         return labeled
 
     def _parse_account_activity_payload(self, payload: Any) -> Mapping[str, Any] | None:
@@ -1143,7 +1149,10 @@ class SchwabExecutionClient(LiveExecutionClient):
             return parsed
         return None
 
-    def _handle_order_activity_payload(self, order_data: Mapping[str, Any]) -> None:
+    def _handle_order_activity_payload(  # noqa: C901
+        self,
+        order_data: Mapping[str, Any],
+    ) -> None:
         raw_order_id = order_data.get("orderId") or order_data.get("order_id")
         if raw_order_id is None:
             return
@@ -1224,7 +1233,7 @@ class SchwabExecutionClient(LiveExecutionClient):
     def _has_seen_stream_trade_id(self, trade_id: TradeId) -> bool:
         return trade_id.value in self._recent_stream_trade_ids_set
 
-    async def _build_position_report(
+    async def _build_position_report(  # noqa: C901
         self,
         position: Mapping[str, Any],
         ts: int,
@@ -1296,8 +1305,6 @@ class SchwabExecutionClient(LiveExecutionClient):
         order_data: Mapping[str, Any],
         instrument_id: InstrumentId,
     ) -> OrderStatusReport | None:
-        order_list_id = None
-        contingency_type = ContingencyType.NO_CONTINGENCY
         venue_order_id = VenueOrderId(str(order_data.get("orderId", "")))
         client_order_id = self._cache.client_order_id(venue_order_id)
         status = SCHWAB_STATUS_MAP.get(
@@ -1336,16 +1343,6 @@ class SchwabExecutionClient(LiveExecutionClient):
             # TODO: need to refine here
             self._log.warning("Trailing stop orders not supported for now!")
             return None
-            # trigger_price = Decimal(self.triggerPrice)
-            # last_price = Decimal(self.lastPriceOnCreated)
-            trailing_offset = order_data.get("priceOffset")
-            trailing_offset_type = TRAILING_OFFSET_TYPE_REVERSE.get(
-                PriceLinkType(order_data.get("priceLinkType")),
-                TrailingOffsetType.NO_TRAILING_OFFSET,
-            )
-        else:
-            trailing_offset = None
-            trailing_offset_type = TrailingOffsetType.NO_TRAILING_OFFSET
         stop_price = order_data.get("stopPrice", None)
 
         if stop_price:

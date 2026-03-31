@@ -14,8 +14,10 @@
 # -------------------------------------------------------------------------------------------------
 from __future__ import annotations
 
+from collections.abc import Mapping
 from collections.abc import Sequence
 from decimal import Decimal
+from typing import Any
 
 from nautilus_trader.adapters.schwab.common import ParsedOpraSymbol
 from nautilus_trader.adapters.schwab.common import parse_opra_symbol
@@ -48,11 +50,11 @@ class SchwabInstrumentProvider(InstrumentProvider):
         super().__init__(config)
         self._client = client
         self._clock = clock
-        self._config = config
+        self._provider_config = config
         self._load_ids_on_start = set(config.load_ids) if config.load_ids is not None else None
         self.instrument_exchange_map: dict[InstrumentId, str] = {}
 
-    async def load_all_async(self, filters=None) -> None:
+    async def load_all_async(self, filters: Mapping[str, Any] | None = None) -> None:
         raise RuntimeError(
             "requesting all instrument definitions is not currently supported, "
             "as this would mean every instrument definition for every dataset "
@@ -62,14 +64,22 @@ class SchwabInstrumentProvider(InstrumentProvider):
     async def load_ids_async(
         self,
         instrument_ids: list[InstrumentId],
-        filters=None,
+        filters: Mapping[str, Any] | None = None,
     ) -> None:
         await self._load_many(instrument_ids)
 
-    async def load_async(self, instrument_id: InstrumentId, filters=None) -> None:
+    async def load_async(
+        self,
+        instrument_id: InstrumentId,
+        filters: Mapping[str, Any] | None = None,
+    ) -> None:
         await self._load_one(instrument_id)
 
-    def _add_instrument(self, instrument_id: InstrumentId, instrument_info: dict) -> None:
+    def _add_instrument(
+        self,
+        instrument_id: InstrumentId,
+        instrument_info: Mapping[str, Any],
+    ) -> None:
         instrument_type = instrument_info["assetMainType"]
         if instrument_type == "OPTION":
             option_meta = parse_opra_symbol(instrument_id.symbol.value)
@@ -132,8 +142,8 @@ class SchwabInstrumentProvider(InstrumentProvider):
     ) -> OptionContract | None:
         symbol = instrument_id.symbol.value
         ts = self._clock.timestamp_ns()
-        precision = self._config.option_price_precision
-        tick_size_str = self._format_decimal(self._config.option_tick_size, precision)
+        precision = self._provider_config.option_price_precision
+        tick_size_str = self._format_decimal(self._provider_config.option_tick_size, precision)
         strike_str = self._format_decimal(option_meta.strike, precision)
 
         try:
@@ -141,18 +151,18 @@ class SchwabInstrumentProvider(InstrumentProvider):
         except AttributeError:
             expiration_ns = ts
 
-        currency = Currency.from_str(self._config.option_currency)
+        currency = Currency.from_str(self._provider_config.option_currency)
         self.add_currency(currency)
 
         option = OptionContract(
             instrument_id=instrument_id,
             raw_symbol=Symbol(symbol),
             asset_class=AssetClass.EQUITY,
-            exchange=self._config.equity_exchange,
+            exchange=self._provider_config.equity_exchange,
             currency=currency,
             price_precision=precision,
             price_increment=Price.from_str(tick_size_str),
-            multiplier=Quantity.from_int(int(self._config.option_multiplier)),
+            multiplier=Quantity.from_int(int(self._provider_config.option_multiplier)),
             lot_size=Quantity.from_int(1),
             underlying=option_meta.underlying,
             option_kind=option_meta.option_kind,

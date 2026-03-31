@@ -348,7 +348,11 @@ class SchwabWebSocketClient:
         except WebSocketClientError as e:
             self._log.error(str(e))
 
-    def _convert_enum_iterable(self, iterable, required_enum_type):
+    def _convert_enum_iterable(
+        self,
+        iterable: Any,
+        required_enum_type: type[Any],
+    ) -> list[Any] | None:
         if iterable is None:
             return None
 
@@ -363,7 +367,13 @@ class SchwabWebSocketClient:
                 values.append(value)
         return values
 
-    async def _subscribe(self, symbol: str, service: str, command: str, field_type=None) -> None:
+    async def _subscribe(
+        self,
+        symbol: str,
+        service: str,
+        command: str,
+        field_type: type[Any] | None = None,
+    ) -> None:
         self._log.debug(f"Subscribing to {service}.{command} for {symbol}")
         parameters = {
             # 'keys': ','.join(symbol)
@@ -372,9 +382,10 @@ class SchwabWebSocketClient:
 
         if field_type is not None:
             fields = field_type.all_fields()
-
-            fields = sorted(self._convert_enum_iterable(fields, field_type))
-            parameters["fields"] = ",".join(str(f) for f in fields)
+            field_values = self._convert_enum_iterable(fields, field_type)
+            if field_values is None:
+                field_values = []
+            parameters["fields"] = ",".join(str(f) for f in sorted(field_values))
 
         request, request_id = self._make_request(
             service=service,

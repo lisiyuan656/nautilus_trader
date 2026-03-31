@@ -98,6 +98,7 @@ class SchwabDataClient(LiveMarketDataClient):
         )
 
         self._config = config
+        self._schwab_instrument_provider = instrument_provider
         self._http_client = http_client
         self._bars_timestamp_on_close = config.bars_timestamp_on_close
         # WebSocket API
@@ -232,7 +233,7 @@ class SchwabDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.exception(f"Failed to parse level one tick: {msg}", e)
 
-    def _label_book_message(self, msg: dict[str, Any]) -> None:
+    def _label_book_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         new_msg = self._label_message(msg, StreamClient.BookFields)
 
         # Relabel bids
@@ -408,7 +409,7 @@ class SchwabDataClient(LiveMarketDataClient):
     async def _request_trade_ticks(self, request: RequestTradeTicks) -> None:
         raise NotImplementedError
 
-    async def _request_bars(self, request: RequestBars) -> None:
+    async def _request_bars(self, request: RequestBars) -> None:  # noqa: C901
         symbol = request.bar_type.instrument_id.symbol.value
         instrument = self._cache.instrument(request.bar_type.instrument_id)
         if instrument is None:
@@ -546,7 +547,7 @@ class SchwabDataClient(LiveMarketDataClient):
             )
             return
         symbol = command.instrument_id.symbol.value
-        exchange_code = self._instrument_provider.instrument_exchange_map.get(command.instrument_id)
+        exchange_code = self._schwab_instrument_provider.instrument_exchange_map.get(command.instrument_id)
         if exchange_code is None:
             self._log.error(f"No exchange found for {command.instrument_id}")
             return
@@ -567,7 +568,7 @@ class SchwabDataClient(LiveMarketDataClient):
 
     async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
         symbol = command.instrument_id.symbol.value
-        exchange_code = self._instrument_provider.instrument_exchange_map.get(command.instrument_id)
+        exchange_code = self._schwab_instrument_provider.instrument_exchange_map.get(command.instrument_id)
         if exchange_code is None:
             self._log.error(f"No exchange found for {command.instrument_id}")
             return
