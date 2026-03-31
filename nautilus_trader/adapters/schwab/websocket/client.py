@@ -66,6 +66,7 @@ class SchwabWebSocketClient:
             "SMART": "OPTIONS_BOOK",
         }
         self._ws_auth_timeout_secs = 5.0
+        self._account_activity_service = "ACCT_ACTIVITY"
 
     # @property
     # def subscriptions(self) -> list[str]:
@@ -88,11 +89,12 @@ class SchwabWebSocketClient:
 
         config = WebSocketConfig(
             url=self._base_url,
-            handler=self._msg_handler,
             headers=[],
         )
         self._client = await WebSocketClient.connect(
+            loop_=self._loop,
             config=config,
+            handler=self._msg_handler,
         )
 
     async def connect(self) -> None:
@@ -349,6 +351,47 @@ class SchwabWebSocketClient:
                 return
             self._subscriptions[service].remove(symbol)
         await self._subscribe(symbol, service, command)
+
+    async def subscribe_account_activity(self, force: bool = False) -> None:
+        service = self._account_activity_service
+        key = self._stream_correl_id
+        if not key:
+            raise RuntimeError("Stream correl id not initialized; call connect() first")
+        if service not in self._subscriptions or force:
+            self._subscriptions[service] = []
+        if key in self._subscriptions[service] and not force:
+            self._log.warning(
+                f"Cannot subscribe {service} for '{key}': already subscribed",
+            )
+            return
+        if force:
+            self._subscriptions[service].clear()
+        self._subscriptions[service].append(key)
+        await self._subscribe(
+            key,
+            service,
+            "SUBS",
+            field_type=StreamClient.AccountActivityFields,
+        )
+
+    async def unsubscribe_account_activity(self) -> None:
+        service = self._account_activity_service
+        key = self._stream_correl_id
+        if not key:
+            self._log.warning("Cannot unsubscribe account activity: correl id missing")
+            return
+        if service not in self._subscriptions or key not in self._subscriptions[service]:
+            self._log.warning(
+                f"Cannot unsubscribe {service} for '{key}': not subscribed",
+            )
+            return
+        self._subscriptions[service].remove(key)
+        await self._subscribe(
+            key,
+            service,
+            "UNSUBS",
+            field_type=StreamClient.AccountActivityFields,
+        )
 
     async def subscribe_order_book_deltas(self, symbol: str, venue: str) -> None:
         service = self._order_book_deltas_services[venue]

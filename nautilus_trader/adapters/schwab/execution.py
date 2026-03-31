@@ -15,6 +15,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import json
+from collections import deque
 from collections.abc import Mapping
 from datetime import UTC
 from datetime import datetime
@@ -22,6 +25,7 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
+from msgspec import json as msgspec_json
 from schwab.orders.common import Duration as SchwabDuration
 from schwab.orders.common import EquityInstruction
 from schwab.orders.common import OrderStrategyType
@@ -30,6 +34,7 @@ from schwab.orders.common import PriceLinkBasis
 from schwab.orders.common import PriceLinkType
 from schwab.orders.common import Session as SchwabSession
 from schwab.orders.generic import OrderBuilder
+from schwab.streaming import StreamClient
 
 from nautilus_trader.adapters.schwab.common import SCHWAB_VENUE
 from nautilus_trader.adapters.schwab.config import SchwabExecClientConfig
@@ -37,6 +42,7 @@ from nautilus_trader.adapters.schwab.http.client import SchwabHttpClient
 from nautilus_trader.adapters.schwab.http.error import SchwabError
 from nautilus_trader.adapters.schwab.http.error import should_retry
 from nautilus_trader.adapters.schwab.providers import SchwabInstrumentProvider
+from nautilus_trader.adapters.schwab.websocket.client import SchwabWebSocketClient
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.execution.messages import BatchCancelOrders
@@ -172,8 +178,20 @@ class SchwabExecutionClient(LiveExecutionClient):
         self._config = config
         self._client_order_to_venue: dict[ClientOrderId, VenueOrderId] = {}
         self._client_order_to_instrument: dict[ClientOrderId, InstrumentId] = {}
+        self._venue_order_to_client: dict[VenueOrderId, ClientOrderId] = {}
         self._open_orders: dict[VenueOrderId, Mapping[str, Any]] = {}
         self._account_hash: str | None = None
+        self._ws_client = SchwabWebSocketClient(
+            clock=clock,
+            http_client=http_client,
+            handler=self._handle_ws_message,
+            handler_reconnect=self._handle_ws_reconnected,
+            loop=loop,
+        )
+        self._ws_connected = False
+        self._recent_stream_trade_ids: deque[str] = deque()
+        self._recent_stream_trade_ids_set: set[str] = set()
+        self._recent_stream_trade_ids_limit = 2_048
 
         account_id_value = config.account_number
 
@@ -207,6 +225,7 @@ class SchwabExecutionClient(LiveExecutionClient):
     async def _connect(self) -> None:
         await self._instrument_provider.initialize()
         await self._update_account_state()
+        await self._ensure_account_activity_stream()
 
     async def _update_account_state(self) -> None:
         if self._account_hash is None:
@@ -224,6 +243,29 @@ class SchwabExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
+    async def _ensure_account_activity_stream(self) -> None:
+        if self._ws_connected:
+            return
+        try:
+            await self._ws_client.connect()
+            await self._ws_client.subscribe_account_activity()
+        except Exception as exc:
+            self._log.warning(
+                "Failed to initialize Schwab account activity stream",
+                exc_info=exc,
+            )
+            return
+        self._ws_connected = True
+
+    async def _handle_ws_reconnected(self) -> None:
+        try:
+            await self._ws_client.subscribe_account_activity(force=True)
+        except Exception as exc:
+            self._log.warning(
+                "Failed to resubscribe Schwab account activity stream",
+                exc_info=exc,
+            )
+
     async def _disconnect(self) -> None:
         self._log.info("Schwab execution client disconnected", LogColor.BLUE)
 
@@ -237,6 +279,7 @@ class SchwabExecutionClient(LiveExecutionClient):
 
         if order.venue_order_id is not None:
             self._client_order_to_venue[order.client_order_id] = order.venue_order_id
+            self._venue_order_to_client[order.venue_order_id] = order.client_order_id
 
         self.generate_order_submitted(
             strategy_id=order.strategy_id,
@@ -273,6 +316,7 @@ class SchwabExecutionClient(LiveExecutionClient):
         if venue_order_id:
             venue_order = VenueOrderId(venue_order_id)
             self._client_order_to_venue[order.client_order_id] = venue_order
+            self._venue_order_to_client[venue_order] = order.client_order_id
             order_status = await self._http_client.get_order(venue_order_id, self._account_hash)
             if order_status["status"] in ["WORKING", "PENDING_ACTIVATION", "FILLED", "QUEUED", "ACCEPTED"]:
                 self.generate_order_accepted(
@@ -1010,6 +1054,160 @@ class SchwabExecutionClient(LiveExecutionClient):
             client_order_id=client_order_id,
             venue_position_id=None,
         )
+
+    # -- WebSocket handling ----------------------------------------------------------------------
+
+    def _handle_ws_message(self, raw: bytes) -> None:
+        try:
+            msg = msgspec_json.decode(raw)
+        except Exception as exc:
+            self._log.exception("Failed to decode Schwab websocket payload", exc)
+            return
+
+        for section in ("notify", "data"):
+            entries = msg.get(section)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, Mapping):
+                    continue
+                if entry.get("service") != "ACCT_ACTIVITY":
+                    continue
+                if "heartbeat" in entry:
+                    continue
+                self._handle_account_activity_message(entry)
+
+    def _handle_account_activity_message(self, msg: Mapping[str, Any]) -> None:
+        labeled_msg = self._label_account_activity_message(msg)
+        content = labeled_msg.get("content")
+        if not isinstance(content, list):
+            return
+
+        for entry in content:
+            if not isinstance(entry, Mapping):
+                continue
+            payload = entry.get("MESSAGE_DATA")
+            if not payload:
+                continue
+            order_payload = self._parse_account_activity_payload(payload)
+            if order_payload is None:
+                continue
+            self._handle_order_activity_payload(order_payload)
+
+    def _label_account_activity_message(self, msg: Mapping[str, Any]) -> Mapping[str, Any]:
+        if "content" not in msg:
+            return msg
+        labeled = copy.deepcopy(msg)
+        content = msg.get("content")
+        labeled_content = labeled.get("content")
+        if not isinstance(content, list) or not isinstance(labeled_content, list):
+            return msg
+        for idx, entry in enumerate(content):
+            if not isinstance(entry, Mapping):
+                continue
+            try:
+                StreamClient.AccountActivityFields.relabel_message(entry, labeled_content[idx])
+            except Exception:
+                continue
+        return labeled
+
+    def _parse_account_activity_payload(self, payload: Any) -> Mapping[str, Any] | None:
+        if isinstance(payload, Mapping):
+            return payload
+        if not isinstance(payload, str):
+            return None
+        data = payload.strip()
+        if not data:
+            return None
+        try:
+            parsed = json.loads(data)
+        except (TypeError, ValueError):
+            self._log.debug(f"Unable to parse account activity payload: {data}")
+            return None
+        if isinstance(parsed, list):
+            parsed = parsed[0] if parsed else None
+        if isinstance(parsed, Mapping):
+            return parsed
+        return None
+
+    def _handle_order_activity_payload(self, order_data: Mapping[str, Any]) -> None:
+        raw_order_id = order_data.get("orderId") or order_data.get("order_id")
+        if raw_order_id is None:
+            return
+
+        venue_order_id: VenueOrderId | None = None
+        try:
+            venue_order_id = VenueOrderId(str(raw_order_id))
+        except Exception:
+            self._log.debug(f"Unable to parse venue order id from {raw_order_id}")
+            return
+
+        client_order_id = self._cache.client_order_id(venue_order_id)
+        if client_order_id is None:
+            client_order_id = self._venue_order_to_client.get(venue_order_id)
+
+        if client_order_id is None:
+            self._log.debug(
+                f"Skipping Schwab account activity for unknown venue order {venue_order_id}",
+            )
+            return
+
+        order = self._cache.order(client_order_id)
+        if order is None:
+            self._log.debug(f"Skipping account activity: order {client_order_id} missing from cache")
+            return
+
+        instrument_id = self._infer_instrument_id(order_data) or order.instrument_id
+        instrument = self._cache.instrument(instrument_id)
+        if instrument is None:
+            self._log.debug(f"Skipping account activity: instrument {instrument_id} not cached")
+            return
+
+        fills = self._extract_fills(order_data)
+        if not fills:
+            return
+
+        for fill in fills:
+            report = self._build_fill_report(
+                fill,
+                instrument=instrument,
+                instrument_id=instrument.id,
+                venue_order_id=venue_order_id,
+                client_order_id=client_order_id,
+                order_side=order.side,
+            )
+            if report is None:
+                continue
+            if self._has_seen_stream_trade_id(report.trade_id):
+                continue
+            self._remember_stream_trade_id(report.trade_id)
+            self.generate_order_filled(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=venue_order_id,
+                venue_position_id=None,
+                trade_id=report.trade_id,
+                order_side=report.order_side,
+                order_type=order.order_type,
+                last_qty=report.last_qty,
+                last_px=report.last_px,
+                quote_currency=instrument.quote_currency,
+                commission=report.commission,
+                liquidity_side=report.liquidity_side,
+                ts_event=report.ts_event,
+            )
+
+    def _remember_stream_trade_id(self, trade_id: TradeId) -> None:
+        trade_value = trade_id.value
+        self._recent_stream_trade_ids.append(trade_value)
+        self._recent_stream_trade_ids_set.add(trade_value)
+        while len(self._recent_stream_trade_ids) > self._recent_stream_trade_ids_limit:
+            oldest = self._recent_stream_trade_ids.popleft()
+            self._recent_stream_trade_ids_set.discard(oldest)
+
+    def _has_seen_stream_trade_id(self, trade_id: TradeId) -> bool:
+        return trade_id.value in self._recent_stream_trade_ids_set
 
     async def _build_position_report(
         self,
