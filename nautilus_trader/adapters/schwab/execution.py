@@ -274,8 +274,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             venue_order = VenueOrderId(venue_order_id)
             self._client_order_to_venue[order.client_order_id] = venue_order
             order_status = await self._http_client.get_order(venue_order_id, self._account_hash)
-
-            if order_status["status"] in ["WORKING", "PENDING_ACTIVATION"]:
+            if order_status["status"] in ["WORKING", "PENDING_ACTIVATION", "FILLED", "QUEUED", "ACCEPTED"]:
                 self.generate_order_accepted(
                     strategy_id=order.strategy_id,
                     instrument_id=order.instrument_id,
@@ -283,6 +282,36 @@ class SchwabExecutionClient(LiveExecutionClient):
                     venue_order_id=venue_order,
                     ts_event=self._clock.timestamp_ns(),
                 )
+
+                if order_status["status"] == "FILLED":
+                    fills = self._extract_fills(order_status)
+                    instrument = self._cache.instrument(order.instrument_id)
+                    for fill in fills:
+                        report = self._build_fill_report(
+                            fill,
+                            instrument=instrument,
+                            instrument_id=order.instrument_id,
+                            venue_order_id=venue_order,
+                            client_order_id=order.client_order_id,
+                            order_side=order.side, # Use original order side as fallback/context
+                        )
+                        if report:
+                            self.generate_order_filled(
+                                strategy_id=order.strategy_id,
+                                instrument_id=order.instrument_id,
+                                client_order_id=order.client_order_id,
+                                venue_order_id=venue_order,
+                                venue_position_id=None,
+                                trade_id=report.trade_id,
+                                order_side=report.order_side,
+                                order_type=order.order_type,
+                                last_qty=report.last_qty,
+                                last_px=report.last_px,
+                                quote_currency=instrument.quote_currency,
+                                commission=report.commission,
+                                liquidity_side=report.liquidity_side,
+                                ts_event=report.ts_event,
+                            )
             elif order_status["status"] == "REJECTED":
                 self.generate_order_rejected(
                     strategy_id=order.strategy_id,
@@ -291,6 +320,34 @@ class SchwabExecutionClient(LiveExecutionClient):
                     reason=order_status["statusDescription"],
                     ts_event=self._clock.timestamp_ns(),
                 )
+
+    def _get_order_action(self, order: Order) -> EquityInstruction:
+        positions = self._cache.positions(
+            instrument_id=order.instrument_id,
+        )
+        
+        current_position = None
+        for p in positions:
+            if not p.is_closed:
+                current_position = p
+                break
+
+        is_long = current_position is not None and current_position.side == PositionSide.LONG
+        is_short = current_position is not None and current_position.side == PositionSide.SHORT
+
+        if order.side == OrderSide.SELL:
+            if is_long:
+                return EquityInstruction.SELL
+            else:
+                return EquityInstruction.SELL_SHORT
+
+        if order.side == OrderSide.BUY:
+            if is_short:
+                return EquityInstruction.BUY_TO_COVER
+            else:
+                return EquityInstruction.BUY
+
+        return EquityInstruction.SELL if order.side == OrderSide.SELL else EquityInstruction.BUY
 
     async def _submit_limit_order(self, order: LimitOrder) -> None:
         schwab_order = (
@@ -301,7 +358,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_duration(TIME_IN_FORCE_MAP[order.time_in_force])
             .set_order_strategy_type(OrderStrategyType.SINGLE)
             .add_equity_leg(
-                ORDER_ACTION_MAP[order.side],
+                self._get_order_action(order),
                 order.instrument_id.symbol.value,
                 int(
                     order.quantity,
@@ -319,7 +376,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_duration(TIME_IN_FORCE_MAP[order.time_in_force])
             .set_order_strategy_type(OrderStrategyType.SINGLE)
             .add_equity_leg(
-                ORDER_ACTION_MAP[order.side],
+                self._get_order_action(order),
                 order.instrument_id.symbol.value,
                 int(
                     order.quantity,
@@ -339,7 +396,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price(str(order.trigger_price))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
             .add_equity_leg(
-                ORDER_ACTION_MAP[order.side],
+                self._get_order_action(order),
                 order.instrument_id.symbol.value,
                 int(
                     order.quantity,
@@ -360,7 +417,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price(str(order.trigger_price))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
             .add_equity_leg(
-                ORDER_ACTION_MAP[order.side],
+                self._get_order_action(order),
                 order.instrument_id.symbol.value,
                 int(
                     order.quantity,
@@ -382,7 +439,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price_offset(float(order.trailing_offset))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
             .add_equity_leg(
-                ORDER_ACTION_MAP[order.side],
+                self._get_order_action(order),
                 order.instrument_id.symbol.value,
                 int(
                     order.quantity,
@@ -405,7 +462,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price_offset(float(order.trailing_offset))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
             .add_equity_leg(
-                ORDER_ACTION_MAP[order.side],
+                self._get_order_action(order),
                 order.instrument_id.symbol.value,
                 int(
                     order.quantity,
@@ -563,8 +620,13 @@ class SchwabExecutionClient(LiveExecutionClient):
         client_order_id = command.client_order_id
         venue_order_id = command.venue_order_id
 
+        if venue_order_id is None and client_order_id is not None:
+            venue_order_id = self._client_order_to_venue.get(client_order_id)
+
         if venue_order_id:
             order_data = await self._http_client.get_order(venue_order_id, self._account_hash)
+        else:
+            return None
 
         report = self._build_order_status_report(
             order_data,
@@ -907,9 +969,18 @@ class SchwabExecutionClient(LiveExecutionClient):
             except (TypeError, ValueError):
                 pass
 
-        raw_trade_id = (
-            fill.get("executionId") or fill.get("tradeId") or fill.get("legId") or UUID4().value
-        )
+        execution_id = fill.get("executionId")
+        leg_id = fill.get("legId")
+
+        if execution_id and leg_id:
+            raw_trade_id = f"{execution_id}-{leg_id}"
+        elif execution_id:
+            raw_trade_id = str(execution_id)
+        elif leg_id:
+            raw_trade_id = f"{venue_order_id}-{leg_id}"
+        else:
+            raw_trade_id = UUID4().value
+
         trade_id = TradeId(str(raw_trade_id))
 
         currency = getattr(instrument, "currency", USD)
@@ -1023,6 +1094,18 @@ class SchwabExecutionClient(LiveExecutionClient):
             ).upper(),
             OrderStatus.ACCEPTED,
         )
+        
+        filled_qty = float(order_data.get("filledQuantity", 0.0))
+        total_qty = float(order_data.get("quantity", 0.0))
+
+        # Treat fully filled CANCELED orders as FILLED
+        if status == OrderStatus.CANCELED and filled_qty > 0 and filled_qty >= total_qty:
+            status = OrderStatus.FILLED
+
+        # Handle partial fills
+        if status == OrderStatus.SUBMITTED and 0 < filled_qty < total_qty:
+            status = OrderStatus.PARTIALLY_FILLED
+
         raw_type = str(order_data.get("orderType", "")).upper()
         order_type_enum = ORDER_TYPE_REVERSE.get(SchwabOrderType(raw_type))
         tif_value = str(
@@ -1063,17 +1146,12 @@ class SchwabExecutionClient(LiveExecutionClient):
         else:
             stop_type = TriggerType.NO_TRIGGER
 
-        total_qty = float(order_data.get("quantity", 0.0))
-        filled_qty = float(order_data.get("filledQuantity", 0.0))
         limit_price = order_data.get("price")
 
         if limit_price:
             limit_price = Price.from_str(str(limit_price))
 
-        if status == OrderStatus.FILLED:
-            avg_price = Decimal(self._parse_avg_price(order_data))
-        else:
-            avg_price = Decimal()
+        avg_price = Decimal(self._parse_avg_price(order_data))
 
         ts_init = self._clock.timestamp_ns()
 
@@ -1117,8 +1195,29 @@ class SchwabExecutionClient(LiveExecutionClient):
         return report
 
     def _parse_avg_price(self, order_data: Mapping[str, Any]) -> float:
-        # TODO: need to support options and orders that are filled in separate times
-        return order_data.get("orderActivityCollection").get("executionLegs")[0].get("price")
+        total_value = 0.0
+        total_qty = 0.0
+        
+        activities = order_data.get("orderActivityCollection")
+        if isinstance(activities, list):
+            for activity in activities:
+                if activity.get("activityType") != "EXECUTION":
+                    continue
+                
+                # Skip cancellations/rejections if they appear in activity collection
+                if activity.get("executionType") in ("CANCELED", "REJECTED", "EXPIRED"):
+                    continue
+
+                legs = activity.get("executionLegs")
+                if isinstance(legs, list):
+                    for leg in legs:
+                        qty = float(leg.get("quantity", 0.0))
+                        price = float(leg.get("price", 0.0))
+                        if qty > 0:
+                            total_value += price * qty
+                            total_qty += qty
+                            
+        return total_value / total_qty if total_qty > 0 else 0.0
 
     def _parse_order_side(self, order_data: Mapping[str, Any]) -> OrderSide:
         legs = order_data.get("orderLegCollection")
@@ -1136,6 +1235,16 @@ class SchwabExecutionClient(LiveExecutionClient):
 
         if isinstance(activities, list):
             for activity in activities:
+                activity_type = activity.get("activityType")
+                if activity_type != "EXECUTION":
+                    self._log.debug(f"Skipping order activity type: {activity_type}")
+                    continue
+
+                execution_type = activity.get("executionType")
+                if execution_type in ("CANCELED", "REJECTED", "EXPIRED"):
+                    continue
+
+                execution_id = activity.get("executionId")
                 execution_legs = (
                     activity.get("executionLegs")
                     if isinstance(
@@ -1146,16 +1255,12 @@ class SchwabExecutionClient(LiveExecutionClient):
                 )
 
                 if isinstance(execution_legs, list):
-                    fills.extend(
-                        [
-                            leg
-                            for leg in execution_legs
-                            if isinstance(
-                                leg,
-                                Mapping,
-                            )
-                        ],
-                    )
+                    for leg in execution_legs:
+                        if isinstance(leg, Mapping):
+                            leg_data = dict(leg)
+                            if execution_id:
+                                leg_data["executionId"] = execution_id
+                            fills.append(leg_data)
         return fills
 
     def _instrument_id_from_symbol(self, symbol: str, asset_type: str) -> InstrumentId:
