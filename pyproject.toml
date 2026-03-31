@@ -83,6 +83,7 @@ ib = [
 docker = ["docker>=7.1.0,<8.0.0"]
 polymarket = ["py-clob-client>=0.34.6,<1.0.0"]
 visualization = ["plotly>=6.6.0,<7.0.0"]
+schwab = ["schwab-py==1.5.0"]
 
 [dependency-groups]
 dev = [
