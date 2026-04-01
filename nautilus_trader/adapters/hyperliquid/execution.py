@@ -312,7 +312,7 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         is_cross: bool,
     ) -> str | None:
         if metadata is None:
-            return "venue metadata unavailable for startup leverage check"
+            return None
 
         if not metadata.get("active", True):
             return "instrument is inactive or delisted"
@@ -342,8 +342,27 @@ class HyperliquidExecutionClient(LiveExecutionClient):
         metadata_by_symbol: dict[str, dict[str, Any]] = {}
         for dex in sorted(dexes, key=lambda value: (value is not None, value or "")):
             try:
-                raw_meta = await get_perp_meta(dex)
+                if dex is None:
+                    raw_meta = await get_perp_meta()
+                else:
+                    raw_meta = await get_perp_meta(dex)
                 parsed = json.loads(raw_meta)
+            except TypeError:
+                if dex is not None:
+                    self._log.debug(
+                        f"HyperliquidHttpClient.get_perp_meta has no dex argument; "
+                        f"skipping pre-check metadata for {dex} startup leverage checks",
+                    )
+                    continue
+
+                try:
+                    raw_meta = await get_perp_meta()
+                    parsed = json.loads(raw_meta)
+                except Exception as e:
+                    self._log.warning(
+                        f"Could not load Hyperliquid perp metadata for core startup leverage checks: {e}",
+                    )
+                    continue
             except Exception as e:
                 scope = dex or "core"
                 self._log.warning(

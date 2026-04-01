@@ -235,9 +235,41 @@ async def test_connect_skips_startup_leverage_without_metadata(
 
     try:
         # Assert
-        http_client.update_leverage.assert_not_awaited()
+        assert http_client.update_leverage.await_count == 2
         ws_client.connect.assert_awaited_once()
         http_client.request_account_state.assert_awaited_once()
+    finally:
+        await client._disconnect()
+
+
+@pytest.mark.asyncio
+async def test_connect_applies_startup_leverage_for_hip3_when_meta_has_no_dex_arg(
+    exec_client_builder,
+    monkeypatch,
+):
+    # Arrange
+    client, ws_client, http_client, instrument_provider = exec_client_builder(
+        monkeypatch,
+        config_kwargs={
+            "startup_leverage": 1,
+            "startup_is_cross": False,
+        },
+    )
+    hip3_instrument = MagicMock()
+    hip3_instrument.id = InstrumentId.from_str("xyz:HIMS-USD-PERP.HYPERLIQUID")
+    instrument_provider.list_all.return_value = [hip3_instrument]
+    http_client.get_perp_meta = AsyncMock(side_effect=TypeError("takes no arguments"))
+
+    # Act
+    await client._connect()
+
+    try:
+        # Assert
+        http_client.update_leverage.assert_awaited_once()
+        awaited_call = http_client.update_leverage.await_args_list[0]
+        assert str(awaited_call.args[0]) == "xyz:HIMS-USD-PERP.HYPERLIQUID"
+        assert awaited_call.args[1:] == (1, False)
+        ws_client.connect.assert_awaited_once()
     finally:
         await client._disconnect()
 
