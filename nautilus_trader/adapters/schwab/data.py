@@ -19,6 +19,7 @@ import copy
 import datetime as dt
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Mapping
 from typing import Any
 
 from msgspec import json as msgspec_json
@@ -294,7 +295,15 @@ class SchwabDataClient(LiveMarketDataClient):
                                     bid["BID_PRICE"],
                                     instrument.price_precision,
                                 ),
-                                size=Quantity.from_int(bid["NUM_BIDS"]),
+                                size=Quantity(
+                                    self._book_level_volume(
+                                        bid,
+                                        total_volume_key="TOTAL_VOLUME",
+                                        exchange_levels_key="BIDS",
+                                        exchange_volume_key="BID_VOLUME",
+                                    ),
+                                    instrument.size_precision,
+                                ),
                                 order_id=0,
                             ),
                             flags=0,
@@ -314,7 +323,15 @@ class SchwabDataClient(LiveMarketDataClient):
                                     ask["ASK_PRICE"],
                                     instrument.price_precision,
                                 ),
-                                size=Quantity.from_int(ask["NUM_ASKS"]),
+                                size=Quantity(
+                                    self._book_level_volume(
+                                        ask,
+                                        total_volume_key="TOTAL_VOLUME",
+                                        exchange_levels_key="ASKS",
+                                        exchange_volume_key="ASK_VOLUME",
+                                    ),
+                                    instrument.size_precision,
+                                ),
                                 order_id=0,
                             ),
                             flags=0,
@@ -331,6 +348,32 @@ class SchwabDataClient(LiveMarketDataClient):
         except Exception as e:
             self._log.exception(f"Failed to parse level two tick: {msg}", e)
 
+    @staticmethod
+    def _book_level_volume(
+        level: Mapping[str, Any],
+        *,
+        total_volume_key: str,
+        exchange_levels_key: str,
+        exchange_volume_key: str,
+    ) -> float:
+        volume = level.get(total_volume_key)
+        if volume is not None:
+            return float(volume)
+
+        exchange_levels = level.get(exchange_levels_key)
+        if not isinstance(exchange_levels, list):
+            return 0.0
+
+        total = 0.0
+        for exchange_level in exchange_levels:
+            if not isinstance(exchange_level, Mapping):
+                continue
+            exchange_volume = exchange_level.get(exchange_volume_key)
+            if exchange_volume is None:
+                continue
+            total += float(exchange_volume)
+        return total
+
     async def _connect(self) -> None:
         await self._instrument_provider.initialize()
         self._ws_connected_event.clear()
@@ -342,6 +385,7 @@ class SchwabDataClient(LiveMarketDataClient):
         self._last_quotes.clear()
         self._last_trades.clear()
         self._ws_connected_event.clear()
+        await self._ws_client.disconnect()
 
     def _handle_ws_message(self, raw: bytes) -> None:
         msg = msgspec_json.decode(raw)
@@ -438,12 +482,12 @@ class SchwabDataClient(LiveMarketDataClient):
             frequency = Client.PriceHistory.Frequency.EVERY_THIRTY_MINUTES
         elif td == dt.timedelta(days=1):
             frequency_type = Client.PriceHistory.FrequencyType.DAILY
-            frequency = Client.PriceHistory.Frequency.DAILY
+            frequency = Client.PriceHistory.Frequency.EVERY_MINUTE
             period_type = Client.PriceHistory.PeriodType.YEAR
             period = Client.PriceHistory.Period.TWENTY_YEARS
         elif td == dt.timedelta(weeks=1):
             frequency_type = Client.PriceHistory.FrequencyType.WEEKLY
-            frequency = Client.PriceHistory.Frequency.WEEKLY
+            frequency = Client.PriceHistory.Frequency.EVERY_MINUTE
             period_type = Client.PriceHistory.PeriodType.YEAR
             period = Client.PriceHistory.Period.TWENTY_YEARS
         else:
@@ -480,7 +524,7 @@ class SchwabDataClient(LiveMarketDataClient):
                 frequency=frequency,
                 start_datetime=start_dt,
                 end_datetime=end_dt,
-                need_extended_hours_data=True,
+                need_extended_hours_data=self._config.include_pre_market,
                 need_previous_close=False,
             )
         except Exception as e:

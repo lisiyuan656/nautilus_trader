@@ -11,4 +11,18 @@ class SchwabError(Exception):
 
 
 def should_retry(error: BaseException) -> bool:
-    return False
+    status_code = getattr(error, "status_code", None)
+
+    if status_code is None:
+        status_code = getattr(error, "status", None)
+
+    response = getattr(error, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+
+    return status_code == 429 or status_code >= 500

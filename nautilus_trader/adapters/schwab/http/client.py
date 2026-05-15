@@ -33,6 +33,16 @@ class SchwabHttpClientError(RuntimeError):
     Raised when the Schwab client cannot fulfil a request.
     """
 
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        response_body: Any | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
+
 
 class SchwabHttpClient:
     """
@@ -138,6 +148,8 @@ class SchwabHttpClient:
             raise SchwabHttpClientError(
                 "place_order failed "
                 f"(status={response.status_code}, body={response_body!r}, order_spec={dict(order_spec)!r})",
+                status_code=response.status_code,
+                response_body=response_body,
             )
         order_id = Utils(self._client, account_hash).extract_order_id(response)
         assert order_id is not None

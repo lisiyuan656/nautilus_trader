@@ -26,9 +26,11 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
+from httpx import HTTPStatusError
 from msgspec import json as msgspec_json
 from schwab.orders.common import Duration as SchwabDuration
 from schwab.orders.common import EquityInstruction
+from schwab.orders.common import OptionInstruction
 from schwab.orders.common import OrderStrategyType
 from schwab.orders.common import OrderType as SchwabOrderType
 from schwab.orders.common import PriceLinkBasis
@@ -38,8 +40,10 @@ from schwab.orders.generic import OrderBuilder
 from schwab.streaming import StreamClient
 
 from nautilus_trader.adapters.schwab.common import SCHWAB_VENUE
+from nautilus_trader.adapters.schwab.common import parse_opra_symbol
 from nautilus_trader.adapters.schwab.config import SchwabExecClientConfig
 from nautilus_trader.adapters.schwab.http.client import SchwabHttpClient
+from nautilus_trader.adapters.schwab.http.client import SchwabHttpClientError
 from nautilus_trader.adapters.schwab.http.error import SchwabError
 from nautilus_trader.adapters.schwab.http.error import should_retry
 from nautilus_trader.adapters.schwab.providers import SchwabInstrumentProvider
@@ -66,6 +70,7 @@ from nautilus_trader.live.execution_client import LiveExecutionClient
 from nautilus_trader.live.retry import RetryManagerPool
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import AccountType
+from nautilus_trader.model.enums import InstrumentClass
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.enums import OrderSide
@@ -136,7 +141,7 @@ TRIGGER_TYPE_MAP = {
 }
 
 SCHWAB_STATUS_MAP = {
-    "ACCEPTED": OrderStatus.INITIALIZED,
+    "ACCEPTED": OrderStatus.ACCEPTED,
     "WORKING": OrderStatus.SUBMITTED,
     "QUEUED": OrderStatus.SUBMITTED,
     "PENDING_ACTIVATION": OrderStatus.SUBMITTED,
@@ -219,7 +224,7 @@ class SchwabExecutionClient(LiveExecutionClient):
             delay_max_ms=config.retry_delay_max_ms or 10_000,
             backoff_factor=2,
             logger=self._log,
-            exc_types=(SchwabError,),
+            exc_types=(SchwabError, SchwabHttpClientError, HTTPStatusError),
             retry_check=should_retry,
         )
 
@@ -277,6 +282,8 @@ class SchwabExecutionClient(LiveExecutionClient):
             )
 
     async def _disconnect(self) -> None:
+        await self._ws_client.disconnect()
+        self._ws_connected = False
         self._log.info("Schwab execution client disconnected", LogColor.BLUE)
 
     # -- COMMAND HANDLERS -------------------------------------------------------------------------
@@ -408,45 +415,96 @@ class SchwabExecutionClient(LiveExecutionClient):
 
         return EquityInstruction.SELL if order.side == OrderSide.SELL else EquityInstruction.BUY
 
+    def _is_option_order(self, order: Order) -> bool:
+        instrument = self._cache.instrument(order.instrument_id)
+
+        if instrument is None:
+            instrument = self._instrument_provider.find(order.instrument_id)
+
+        if instrument is not None:
+            return instrument.instrument_class == InstrumentClass.OPTION
+
+        with suppress(ValueError):
+            parse_opra_symbol(order.instrument_id.symbol.value)
+            return True
+
+        return False
+
+    def _get_option_action(self, order: Order) -> OptionInstruction:
+        positions = self._cache.positions(
+            instrument_id=order.instrument_id,
+        )
+
+        current_position = None
+        for p in positions:
+            if not p.is_closed:
+                current_position = p
+                break
+
+        is_long = current_position is not None and current_position.side == PositionSide.LONG
+        is_short = current_position is not None and current_position.side == PositionSide.SHORT
+
+        if order.side == OrderSide.SELL and is_long:
+            return OptionInstruction.SELL_TO_CLOSE
+        if order.side == OrderSide.BUY and is_short:
+            return OptionInstruction.BUY_TO_CLOSE
+
+        config_value = (
+            self._config.default_instruction_option_sell
+            if order.side == OrderSide.SELL
+            else self._config.default_instruction_option_buy
+        )
+        try:
+            return OptionInstruction(config_value)
+        except ValueError:
+            return (
+                OptionInstruction.SELL_TO_CLOSE
+                if order.side == OrderSide.SELL
+                else OptionInstruction.BUY_TO_OPEN
+            )
+
+    def _add_order_leg(self, builder: OrderBuilder, order: Order) -> OrderBuilder:
+        quantity = int(order.quantity)
+        symbol = order.instrument_id.symbol.value
+
+        if self._is_option_order(order):
+            return builder.add_option_leg(
+                self._get_option_action(order),
+                symbol,
+                quantity,
+            )
+
+        return builder.add_equity_leg(
+            self._get_order_action(order),
+            symbol,
+            quantity,
+        )
+
     async def _submit_limit_order(self, order: LimitOrder) -> None:
-        schwab_order = (
+        builder = (
             OrderBuilder()
             .set_order_type(ORDER_TYPE_MAP[order.order_type])
             .set_price(str(order.price))
             .set_session(SchwabSession.NORMAL)
             .set_duration(TIME_IN_FORCE_MAP[order.time_in_force])
             .set_order_strategy_type(OrderStrategyType.SINGLE)
-            .add_equity_leg(
-                self._get_order_action(order),
-                order.instrument_id.symbol.value,
-                int(
-                    order.quantity,
-                ),
-            )
-            .build()
         )
+        schwab_order = self._add_order_leg(builder, order).build()
         await self._submit_and_check_order(order, schwab_order)
 
     async def _submit_market_order(self, order: MarketOrder) -> None:
-        schwab_order = (
+        builder = (
             OrderBuilder()
             .set_order_type(ORDER_TYPE_MAP[order.order_type])
             .set_session(SchwabSession.NORMAL)
             .set_duration(TIME_IN_FORCE_MAP[order.time_in_force])
             .set_order_strategy_type(OrderStrategyType.SINGLE)
-            .add_equity_leg(
-                self._get_order_action(order),
-                order.instrument_id.symbol.value,
-                int(
-                    order.quantity,
-                ),
-            )
-            .build()
         )
+        schwab_order = self._add_order_leg(builder, order).build()
         await self._submit_and_check_order(order, schwab_order)
 
     async def _submit_stop_market_order(self, order: StopMarketOrder) -> None:
-        schwab_order = (
+        builder = (
             OrderBuilder()
             .set_order_type(ORDER_TYPE_MAP[order.order_type])
             .set_session(SchwabSession.NORMAL)
@@ -454,19 +512,12 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price_link_basis(TRIGGER_TYPE_MAP[order.trigger_type])
             .set_stop_price(str(order.trigger_price))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
-            .add_equity_leg(
-                self._get_order_action(order),
-                order.instrument_id.symbol.value,
-                int(
-                    order.quantity,
-                ),
-            )
-            .build()
         )
+        schwab_order = self._add_order_leg(builder, order).build()
         await self._submit_and_check_order(order, schwab_order)
 
     async def _submit_stop_limit_order(self, order: StopMarketOrder) -> None:
-        schwab_order = (
+        builder = (
             OrderBuilder()
             .set_order_type(ORDER_TYPE_MAP[order.order_type])
             .set_session(SchwabSession.NORMAL)
@@ -475,19 +526,12 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price_link_basis(TRIGGER_TYPE_MAP[order.trigger_type])
             .set_stop_price(str(order.trigger_price))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
-            .add_equity_leg(
-                self._get_order_action(order),
-                order.instrument_id.symbol.value,
-                int(
-                    order.quantity,
-                ),
-            )
-            .build()
         )
+        schwab_order = self._add_order_leg(builder, order).build()
         await self._submit_and_check_order(order, schwab_order)
 
     async def _submit_trailing_stop_market_order(self, order: TrailingStopMarketOrder) -> None:
-        schwab_order = (
+        builder = (
             OrderBuilder()
             .set_order_type(ORDER_TYPE_MAP[order.order_type])
             .set_session(SchwabSession.NORMAL)
@@ -497,19 +541,12 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price_link_type(TRAILING_OFFSET_TYPE_MAP[order.trailing_offset_type])
             .set_stop_price_offset(float(order.trailing_offset))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
-            .add_equity_leg(
-                self._get_order_action(order),
-                order.instrument_id.symbol.value,
-                int(
-                    order.quantity,
-                ),
-            )
-            .build()
         )
+        schwab_order = self._add_order_leg(builder, order).build()
         await self._submit_and_check_order(order, schwab_order)
 
     async def _submit_trailing_stop_limit_order(self, order: TrailingStopLimitOrder) -> None:
-        schwab_order = (
+        builder = (
             OrderBuilder()
             .set_order_type(ORDER_TYPE_MAP[order.order_type])
             .set_session(SchwabSession.NORMAL)
@@ -520,15 +557,8 @@ class SchwabExecutionClient(LiveExecutionClient):
             .set_stop_price_link_type(TRAILING_OFFSET_TYPE_MAP[order.trailing_offset_type])
             .set_stop_price_offset(float(order.trailing_offset))
             .set_order_strategy_type(OrderStrategyType.SINGLE)
-            .add_equity_leg(
-                self._get_order_action(order),
-                order.instrument_id.symbol.value,
-                int(
-                    order.quantity,
-                ),
-            )
-            .build()
         )
+        schwab_order = self._add_order_leg(builder, order).build()
         await self._submit_and_check_order(order, schwab_order)
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:

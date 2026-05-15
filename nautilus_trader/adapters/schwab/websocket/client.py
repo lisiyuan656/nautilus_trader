@@ -2,6 +2,7 @@ import asyncio
 import copy
 from collections.abc import Awaitable
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 from weakref import WeakSet
 
@@ -58,6 +59,8 @@ class SchwabWebSocketClient:
         self._loop = loop
         self._tasks: WeakSet[asyncio.Task] = WeakSet()
         self._client: WebSocketClient | None = None
+        self._connect_lock = asyncio.Lock()
+        self._connect_ref_count = 0
         self._auth_event = asyncio.Event()
 
         self._is_authenticated = False
@@ -97,6 +100,37 @@ class SchwabWebSocketClient:
     # def has_subscription(self, item: str) -> bool:
     #     return item in self._subscriptions
 
+    def _is_transport_active(self) -> bool:
+        return (
+            self._client is not None
+            and self._client.is_active()
+            and self._is_authenticated
+        )
+
+    def _ensure_connection_monitor(self) -> None:
+        if self._connection_monitor_task is not None and not self._connection_monitor_task.done():
+            return
+        self._connection_monitor_task = self._loop.create_task(self._connection_monitor())
+        self._tasks.add(self._connection_monitor_task)
+
+    async def _close_transport(self, cancel_monitor: bool) -> None:
+        if cancel_monitor and self._connection_monitor_task is not None:
+            monitor_task = self._connection_monitor_task
+            self._connection_monitor_task = None
+            if monitor_task is not asyncio.current_task() and not monitor_task.done():
+                monitor_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitor_task
+
+        client = self._client
+        self._client = None
+        self._is_authenticated = False
+        self._auth_event.clear()
+        self._last_msg_ts = None
+
+        if client is not None and not client.is_closed():
+            await client.disconnect()
+
     async def _init_from_preferences(self, prefs: dict[str, Any]) -> None:
         # Record streamer subscription keys
         stream_info = prefs["streamerInfo"][0]
@@ -121,9 +155,9 @@ class SchwabWebSocketClient:
         )
         self._log.info("Schwab websocket transport opened", LogColor.BLUE)
 
-    async def connect(self) -> None:
+    async def _open_and_authenticate(self) -> None:
         """
-        Connect websocket clients to the server based on existing subscriptions.
+        Open and authenticate the websocket transport.
         """
         # Recreate the http client in case the token is updated
         self._log.info("Initializing Schwab streaming session", LogColor.BLUE)
@@ -159,16 +193,39 @@ class SchwabWebSocketClient:
 
         self._log.info("Schwab websocket session authenticated", LogColor.BLUE)
 
-        # Start connection monitor
-        if self._connection_monitor_task is None:
-            self._connection_monitor_task = self._loop.create_task(self._connection_monitor())
-            self._tasks.add(self._connection_monitor_task)
+    async def connect(self) -> None:
+        """
+        Connect websocket clients to the server based on existing subscriptions.
+        """
+        async with self._connect_lock:
+            self._connect_ref_count += 1
+            try:
+                if self._is_transport_active():
+                    self._log.debug("Schwab websocket transport already active")
+                    self._ensure_connection_monitor()
+                    return
+
+                await self._close_transport(cancel_monitor=False)
+                await self._open_and_authenticate()
+                self._ensure_connection_monitor()
+            except Exception:
+                self._connect_ref_count = max(0, self._connect_ref_count - 1)
+                await self._close_transport(cancel_monitor=False)
+                raise
 
     async def reconnect(self) -> None:
         """
         Reconnect the client to the server and resubscribe to all streams.
         """
-        await self.connect()
+        async with self._connect_lock:
+            try:
+                await self._close_transport(cancel_monitor=False)
+                await self._open_and_authenticate()
+                self._ensure_connection_monitor()
+            except Exception:
+                await self._close_transport(cancel_monitor=False)
+                raise
+
         await self._subscribe_all()
         for handler in self._reconnect_handlers:
             await handler()
@@ -231,7 +288,21 @@ class SchwabWebSocketClient:
                 is_first_symbol_for_service = False
 
     async def disconnect(self) -> None:
-        pass
+        async with self._connect_lock:
+            if self._connect_ref_count > 0:
+                self._connect_ref_count -= 1
+
+            if self._connect_ref_count > 0:
+                self._log.debug(
+                    f"Schwab websocket still shared by {self._connect_ref_count} client(s)",
+                )
+                return
+
+            self._connect_ref_count = 0
+            try:
+                await self._close_transport(cancel_monitor=True)
+            finally:
+                self._subscriptions.clear()
 
     def _make_request(self, *, service, command, parameters):
         request_id = self._request_id
@@ -393,7 +464,7 @@ class SchwabWebSocketClient:
             parameters=parameters,
         )
 
-        await self._send(request)
+        await self._send({"requests": [request]})
 
     ################################################################################
     # Public
