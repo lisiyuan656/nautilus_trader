@@ -304,36 +304,42 @@ class SchwabExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
-        retry_manager = await self._retry_manager_pool.acquire()
         try:
-            await retry_manager.run(
-                "submit_order",
-                [order.client_order_id],
-                self._submit_order_methods[order.order_type],
-                order,
+            await self._submit_order_methods[order.order_type](order)
+        except (SchwabError, SchwabHttpClientError, HTTPStatusError, ValueError) as exc:
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=str(exc),
+                ts_event=self._clock.timestamp_ns(),
             )
-
-            if not retry_manager.result:
-                self.generate_order_rejected(
-                    strategy_id=order.strategy_id,
-                    instrument_id=order.instrument_id,
-                    client_order_id=order.client_order_id,
-                    reason=retry_manager.message,
-                    ts_event=self._clock.timestamp_ns(),
-                )
-        finally:
-            await self._retry_manager_pool.release(retry_manager)
 
     async def _submit_and_check_order(self, order: Order, order_spec: Mapping[str, Any]) -> None:
         if order.is_post_only:
             raise ValueError("`post_only` not supported by Schwab")
+
         venue_order_id = await self._http_client.place_order(self._account_hash, order_spec)
 
         if venue_order_id:
             venue_order = VenueOrderId(venue_order_id)
             self._client_order_to_venue[order.client_order_id] = venue_order
             self._venue_order_to_client[venue_order] = order.client_order_id
-            order_status = await self._http_client.get_order(venue_order_id, self._account_hash)
+            order_status = await self._get_order_status_after_submit(venue_order_id)
+            if order_status is None:
+                self._log.warning(
+                    f"Unable to retrieve Schwab order status after placement for {venue_order}; "
+                    "reporting order accepted from placement response",
+                )
+                self.generate_order_accepted(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    venue_order_id=venue_order,
+                    ts_event=self._clock.timestamp_ns(),
+                )
+                return
+
             if order_status["status"] in [
                 "WORKING",
                 "PENDING_ACTIVATION",
@@ -386,6 +392,31 @@ class SchwabExecutionClient(LiveExecutionClient):
                     reason=order_status["statusDescription"],
                     ts_event=self._clock.timestamp_ns(),
                 )
+
+    async def _get_order_status_after_submit(
+        self,
+        venue_order_id: str,
+    ) -> Mapping[str, Any] | None:
+        retry_manager = await self._retry_manager_pool.acquire()
+        try:
+            order_status = await retry_manager.run(
+                "get_order_after_submit",
+                [venue_order_id],
+                self._http_client.get_order,
+                order_id=venue_order_id,
+                account_hash=self._account_hash,
+            )
+
+            if retry_manager.result:
+                return order_status
+
+            self._log.warning(
+                f"Failed to retrieve Schwab order status for {venue_order_id}: "
+                f"{retry_manager.message}",
+            )
+            return None
+        finally:
+            await self._retry_manager_pool.release(retry_manager)
 
     def _get_order_action(self, order: Order) -> EquityInstruction:
         positions = self._cache.positions(
