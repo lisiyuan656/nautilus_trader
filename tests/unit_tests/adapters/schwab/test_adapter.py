@@ -16,6 +16,7 @@
 import asyncio
 from types import SimpleNamespace
 from typing import Any
+from typing import cast
 
 import httpx
 import pytest
@@ -70,7 +71,7 @@ async def test_subscribe_sends_schwab_request_envelope() -> None:
     sent: list[dict[str, Any]] = []
     client = SchwabWebSocketClient(
         clock=StubClock(),
-        http_client=SimpleNamespace(),
+        http_client=cast(Any, SimpleNamespace()),
         handler=None,
         handler_reconnect=None,
         loop=asyncio.get_running_loop(),
@@ -94,7 +95,7 @@ async def test_disconnect_closes_transport_when_last_reference_disconnects() -> 
     transport = StubWebSocket()
     client = SchwabWebSocketClient(
         clock=StubClock(),
-        http_client=SimpleNamespace(),
+        http_client=cast(Any, SimpleNamespace()),
         handler=None,
         handler_reconnect=None,
         loop=asyncio.get_running_loop(),
@@ -183,7 +184,11 @@ def test_add_order_leg_uses_option_leg_for_option_orders() -> None:
         quantity=1,
     )
 
-    order_spec = SchwabExecutionClient._add_order_leg(client, OrderBuilder(), order).build()
+    order_spec = SchwabExecutionClient._add_order_leg(
+        cast(Any, client),
+        OrderBuilder(),
+        cast(Any, order),
+    ).build()
 
     leg = order_spec["orderLegCollection"][0]
     assert leg["instruction"] == "BUY_TO_OPEN"
@@ -222,7 +227,7 @@ async def test_submit_order_does_not_retry_whole_submission_on_retryable_error()
     )
     command = SimpleNamespace(order=order)
 
-    await SchwabExecutionClient._submit_order(client, command)
+    await SchwabExecutionClient._submit_order(cast(Any, client), cast(Any, command))
 
     assert submit_calls == 1
     assert len(rejected_events) == 1
@@ -259,7 +264,7 @@ async def test_submit_reports_accepted_without_replacing_order_when_status_looku
         instrument_id=InstrumentId.from_str("AAPL.SCHWAB"),
     )
 
-    await SchwabExecutionClient._submit_and_check_order(client, order, {})
+    await SchwabExecutionClient._submit_and_check_order(cast(Any, client), cast(Any, order), {})
 
     assert place_calls == 1
     assert client._client_order_to_venue[order.client_order_id] == VenueOrderId("12345")
@@ -303,7 +308,7 @@ async def test_get_order_status_after_submit_retries_status_lookup() -> None:
         _log=StubLogger(),
     )
 
-    result = await SchwabExecutionClient._get_order_status_after_submit(client, "12345")
+    result = await SchwabExecutionClient._get_order_status_after_submit(cast(Any, client), "12345")
 
     assert result == {"status": "WORKING"}
     assert http_client.calls == 3
